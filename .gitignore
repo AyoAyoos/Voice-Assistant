@@ -1,0 +1,20 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+web/node_modules/
+web/dist/
+tools/autohotkey/
+.voice-pids.json
+.voice-hotkey.log
+.voice-backend.log
+.voice-backend.err.log
+server.log
+server.err.log
+.voice-browser-profile/
+# Root-only: nested pipecat/.../data folders hold vendored ONNX models.
+/data/
+/logs/
+*.duckdb
+*.duckdb.wal
