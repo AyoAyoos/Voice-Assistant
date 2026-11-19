@@ -238,6 +238,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scrip
 | `BRAVE_API_KEY` | empty | Optional Brave fallback when a Tavily call fails |
 | `LOCAL_STT_MODEL` | `small.en` | faster-whisper model for offline STT |
 | `LOCAL_LLM_MODEL` | `qwen2.5:3b-instruct` | Ollama chat model for offline LLM |
+| `LOCAL_LLM_TEMPERATURE` | `0.7` | Sampling temperature for the local fallback LLM (0–2) |
 | `LOCAL_TTS_VOICE` | `en_US-lessac-medium` | Piper voice for offline TTS |
 | `PIPER_MODELS_DIR` | `~/.cache/piper` | Directory holding downloaded Piper voices |
 

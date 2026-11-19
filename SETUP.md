@@ -90,6 +90,7 @@ Other defaults that usually need no change:
 | `BRAVE_API_KEY` | empty | Optional search fallback when Tavily fails |
 | `LOCAL_STT_MODEL` | `small.en` | faster-whisper model for offline STT |
 | `LOCAL_LLM_MODEL` | `qwen2.5:3b-instruct` | Ollama chat model for offline LLM |
+| `LOCAL_LLM_TEMPERATURE` | `0.7` | Local fallback LLM sampling temperature (`0`–`2`) |
 | `LOCAL_TTS_VOICE` | `en_US-lessac-medium` | Piper voice for offline TTS |
 | `OPENCODE_BASE_URL` | `http://127.0.0.1:28894` | Loopback-only coding service; no second agent is started |
 | `OPENCODE_SERVICE_PASSWORD` | empty | Backend-only password; empty reads `~/.config/opencode/service.json` |

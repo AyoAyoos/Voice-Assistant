@@ -807,6 +807,11 @@ async def start_pipeline(
     logger.info(f"Voice session {session_id} backend: {backend_label} ({reason})")
     local_llm_model = os.getenv("LOCAL_LLM_MODEL", "qwen2.5:3b-instruct")
     local_tts_voice = os.getenv("LOCAL_TTS_VOICE", "en_US-lessac-medium")
+    try:
+        local_llm_temperature = float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.7"))
+    except ValueError:
+        local_llm_temperature = 0.7
+    local_llm_temperature = max(0.0, min(2.0, local_llm_temperature))
 
     model_name = (
         os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
@@ -933,7 +938,7 @@ async def start_pipeline(
                 settings=OpenAILLMService.Settings(
                     model=local_llm_model,
                     system_instruction=system_instruction,
-                    temperature=0.4,
+                    temperature=local_llm_temperature,
                     max_tokens=200,
                 ),
                 retry_timeout_secs=5.0,
