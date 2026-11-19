@@ -170,3 +170,42 @@ editing it. Verify the script directly:
 
 Synthetic keyboard events from automation tools may not trigger global hotkeys;
 test by physically pressing `Ctrl + ;`.
+
+## OpenCode coding tools are unavailable
+
+The bridge does not start a coding agent; it only calls the service you already run. Check in this order:
+
+1. `opencode service status` should return `http://127.0.0.1:28894`. If it does not, start/restart the service before debugging the voice app.
+2. `OPENCODE_BASE_URL` must stay on `127.0.0.1`, `localhost`, or `::1`. The client refuses any non-loopback URL.
+3. Leave `OPENCODE_SERVICE_PASSWORD` empty unless the backend cannot read `~/.config/opencode/service.json`. The password is backend-only and never appears in tool results or logs; errors redact it as `***REDACTED***`.
+4. `GET /api/agent` should include `voice-coder` and `voice-planner`. If not, copy the files from `.opencode\agents\` to `~/.config/opencode\agents\` and run `opencode api location.reload`.
+5. `OPENCODE_WORKTREE_ROOT` must be outside `OPENCODE_PROJECT_DIR`. The default root is `D:\voice-assistant-worktrees`, not the live checkout.
+6. Look for `tools.opencode_client` and `tools.voice_tools` warnings in `logs/errors.log` and `.voice-backend.err.log`.
+
+If a requested model is missing, the assistant says so and retains the session's previous model. All models are allowed; there is no provider deny list. Check the live catalog with `GET /api/model` if a name looks wrong.
+
+## OpenCode task says "still running"
+
+`code_task` waits `OPENCODE_TASK_WAIT_SECONDS` (default 45) inside one voice turn, then returns `status: running` and a background finalizer keeps waiting up to `OPENCODE_TASK_TIMEOUT_SECONDS` (default 300). Say "Recap session <short code>" later. The row in `opencode_sessions` is updated when the task finishes. A short code is the last eight characters of the `ses_...` id.
+
+## Approval question never arrives or times out
+
+- In `build` mode, ask for a file edit so OpenCode requests permission. `read` and `plan` modes deny edits by design.
+- "Yes", "approve", "ok", or "once" send the OpenCode decision `once`; "no", "deny", "stop", or "cancel" send `reject`. The bridge never sends `always`.
+- If no spoken answer arrives within `OPENCODE_APPROVAL_TIMEOUT_SECONDS` (default 60), the backend rejects the request and marks the row `interrupted` with reason `Approval timed out`. Check `pending_permission_id` in `opencode_sessions` and `GET /api/session/{id}/permission`.
+- A reply for an expired request returns `status: expired`. Start a new task instead of reusing that request id.
+- Never put approvals in an `always` rule or a broad shell allowlist; keep the narrow voice policies in `.opencode\opencode.jsonc` and the per-session ruleset.
+
+## OpenCode worktree is locked or cleanup fails
+
+Worktrees are deliberately kept for review. On Windows, OpenCode can hold a worktree directory as its current working directory until the session is deleted and the service restarts. A direct delete may return HTTP 400 or `WinError 32`/`145`.
+
+1. Review any changes you still need inside the worktree.
+2. Delete the OpenCode session for that short code (`DELETE /api/session/{id}`).
+3. Run `opencode service restart`, then rerun cleanup:
+
+   ```powershell
+   .\.venv\Scripts\python.exe -c "import asyncio,bootstrap; from tools.opencode_client import opencode_client as c; asyncio.run(c.remove_worktree(r'D:\voice-assistant-worktrees\<name>\<name>'))"
+   ```
+
+Do not force-delete a directory that contains unreviewed changes. Empty wrapper folders are removed automatically only after the nested worktree is gone.

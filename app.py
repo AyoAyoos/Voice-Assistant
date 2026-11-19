@@ -51,7 +51,8 @@ from pipeline import close_memory_client, warm_network, warm_smart_turn  # noqa:
 from routes.webrtc_signaling import router as signaling_router  # noqa: E402
 from storage.duckdb_store import store  # noqa: E402
 from storage.embeddings import embedder  # noqa: E402
-from tools.voice_tools import close_web_client  # noqa: E402
+from tools.opencode_client import close_opencode_client  # noqa: E402
+from tools.voice_tools import cancel_approval_timers, close_web_client  # noqa: E402
 
 
 @asynccontextmanager
@@ -66,6 +67,8 @@ async def lifespan(app: FastAPI):
         await warm_task
         await close_memory_client()
         await close_web_client()
+        await cancel_approval_timers()
+        await close_opencode_client()
         await embedder.close()
         await store.close()
 

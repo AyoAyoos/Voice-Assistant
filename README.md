@@ -10,6 +10,7 @@ This folder is self-contained. No files in the upstream source repository were m
 - **Natural speech-to-speech:** Gemini Live owns STT, LLM and TTS, including barge-in interruption and a graceful spoken goodbye before disconnect. Each call opens a fresh Gemini session — the microphone is not held open between calls.
 - **Offline fallback:** `VOICE_BACKEND=auto` runs a fast Gemini reachability preflight per call; if it fails, the call runs entirely on local models and announces the switch once.
 - **Real tools:** web search (`web_search`, `fetch_page`) via backend-only Tavily (optional Brave fallback), `memory_search`, `get_current_time`, reminder store/recall, `get_system_info`, and `end_conversation` — identical on both backends.
+- **Voice-controlled coding bridge:** `code_task`, `list_code_sessions`, `recap_code_session`, and `code_permission_reply` drive the already-running loopback OpenCode service in isolated git worktrees, with spoken summaries, resumable short codes, and yes/no approvals. No second coding agent is started.
 - **Memory across calls:** durable facts are distilled after each call, embedded locally and injected into the next session's prompt, with recent turns kept for continuity.
 - **Local storage and search:** one DuckDB file holds sessions, transcripts, vectors, reminders and errors; HNSW cosine search falls back to exact/keyword search when Ollama or `vss` is unavailable.
 - **Full-page UI:** neubrutalist React interface with live status, waveform, transcript, and a History & Memory drawer.
@@ -21,7 +22,8 @@ This folder is self-contained. No files in the upstream source repository were m
 | --- | --- |
 | [SETUP.md](SETUP.md) | Step-by-step installation and first run on Windows |
 | [STORAGE_AND_MEMORY.md](STORAGE_AND_MEMORY.md) | Database schema, HNSW indexes, context/memory flow, error logs |
-| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Hotkey, microphone, port, DuckDB, Ollama and Gemini diagnostics |
+| [OPENCODE_BRIDGE.md](OPENCODE_BRIDGE.md) | Voice-driven OpenCode sessions, worktrees, models, approvals, privacy and resume |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Hotkey, microphone, port, DuckDB, Ollama, Gemini and OpenCode diagnostics |
 | [VOICE_ASSISTANT_UI_SPEC_REACT.md](VOICE_ASSISTANT_UI_SPEC_REACT.md) | Original UI behaviour and layout specification |
 | This README | Architecture, configuration, file map and verification notes |
 
@@ -43,6 +45,9 @@ flowchart LR
     Tavily["Tavily API<br/>backend-only key"]
     DB[("DuckDB<br/>sessions / messages / memory<br/>reminders / HNSW / app_errors")]
     Ollama["Local Ollama<br/>nomic-embed-text<br/>768-dim embeddings"]
+    OC["Existing OpenCode service<br/>127.0.0.1:28894<br/>HTTP + SSE"]
+    WT["Isolated git worktree<br/>outside the live checkout"]
+    Note["opencode_sessions notebook<br/>short codes / recaps / approvals"]
 
     Browser -- "SDP offer + ICE candidates" --> WS
     WS -- "SDP answer" --> Browser
@@ -63,6 +68,12 @@ flowchart LR
     Pipeline -- "context + transcripts + errors" --> DB
     DB -- "recent turns + distilled memory" --> Pipeline
     Pipeline -- "local vectors" --> Ollama
+    Pipeline -- "code_task / recap / approval reply" --> Tools
+    Tools -- "HTTP prompts and permission replies" --> OC
+    OC -. "session state and SSE events" .-> Tools
+    OC -- "edits confined to" --> WT
+    Tools -- "short codes, recaps, approval state" --> Note
+    Note -- "resume anchors and prior context" --> Tools
 ```
 
 Per-call backend selection (`VOICE_BACKEND`): `auto` preflights Gemini and uses the local stack when it is unreachable, `gemini` forces Gemini Live, `local` always uses local models.

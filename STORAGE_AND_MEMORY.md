@@ -26,6 +26,37 @@ startup. Deleting it resets all sessions, memory, and stored errors.
 | `message_embeddings` | 768-dim Ollama vectors for transcript turns |
 | `memory_embeddings` | 768-dim Ollama vectors for memory facts |
 | `app_errors` | Backend and reported frontend errors, stack, context, timestamp |
+| `opencode_sessions` | Speakable notebook for OpenCode tasks: short codes, recaps, worktrees, approval state and review status |
+
+### OpenCode session notebook
+
+`opencode_sessions` is created automatically and migrated in place. OpenCode's
+own database remains the source of truth for sessions and messages; this table
+is only a local index for voice recall. Deleting the DuckDB file resets the
+notebook but not OpenCode.
+
+The primary key is `opencode_session_id` (`ses_...`). `short_code` stores the
+last eight characters for spoken lookup and has its own index, as does
+`updated_at`. `project_id` and `worktree_dir` preserve the location-scoped
+context needed to resume a task safely. `status` is one of `running`,
+`succeeded`, `failed`, `interrupted`, `awaiting_approval`, or `idle`;
+`end_reason` and `ended_at` explain the final outcome. `resume_anchor` keeps the
+last user message id.
+
+Task context is stored as summaries only: `mode`, `agent`, `model_provider`,
+`model_id`, `voice_session_id`, `title`, `last_request`, `summary`, and
+`one_line_recap`. `files_changed` and `milestones` are JSON arrays of names and
+short facts, never patches or diff text. `review_state` marks build output for
+manual review. `tokens_input`, `tokens_output`, and `cost` mirror OpenCode
+usage when available.
+
+The active spoken approval is kept in `pending_permission_id`,
+`pending_permission_action`, `pending_permission_resources`,
+`pending_permission_message`, and `pending_expires_at`. An unanswered approval
+is rejected by default when the expiry passes; the row becomes `interrupted`
+with reason `Approval timed out`. `created_at`, `updated_at`, and `metadata`
+finish the row. Service passwords and API keys are never stored here, and all
+error strings are redacted before logging.
 
 ### HNSW vector index
 
@@ -123,3 +154,14 @@ Query the database directly if needed:
 | `MEMORY_DEDUPE_THRESHOLD` | `0.93` | Cosine similarity threshold for memory upsert |
 | `MEMORY_CONTEXT_LIMIT` | `20` | Max memories injected into a call |
 | `CONTEXT_TURN_LIMIT` | `20` | Max older transcript turns injected into a call |
+| `OPENCODE_BASE_URL` | `http://127.0.0.1:28894` | Loopback-only OpenCode service; no new agent is started |
+| `OPENCODE_PROJECT_DIR` | `D:\voice-assistant` | Live checkout used to resolve the OpenCode project id |
+| `OPENCODE_WORKTREE_ROOT` | `D:\voice-assistant-worktrees` | Isolated worktrees, always outside the project dir |
+| `OPENCODE_TASK_WAIT_SECONDS` | `45` | Voice-turn wait before returning `status: running` |
+| `OPENCODE_TASK_TIMEOUT_SECONDS` | `300` | Background finalizer deadline |
+| `OPENCODE_APPROVAL_TIMEOUT_SECONDS` | `60` | Default rejection deadline for spoken approvals |
+
+`OPENCODE_SERVICE_PASSWORD` is intentionally absent from this table: it is a
+backend-only secret read from the environment or the local OpenCode service
+config, never written to the DuckDB notebook, logs, or docs. See
+[OPENCODE_BRIDGE.md](OPENCODE_BRIDGE.md) for the full bridge reference.

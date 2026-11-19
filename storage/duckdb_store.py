@@ -44,8 +44,33 @@ def _json(value: Any) -> str | None:
 
 
 def _redact(text: str) -> str:
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    return text.replace(key, "***REDACTED***") if key else text
+    """Remove every backend credential before anything reaches an error log."""
+    safe = text
+    for name in (
+        "GEMINI_API_KEY",
+        "TAVILY_API_KEY",
+        "BRAVE_API_KEY",
+        "OPENCODE_SERVICE_PASSWORD",
+    ):
+        key = os.getenv(name, "").strip()
+        if key:
+            safe = safe.replace(key, "***REDACTED***")
+    if "OPENCODE_SERVICE_PASSWORD" not in os.environ:
+        try:
+            from pathlib import Path
+
+            config = Path.home() / ".config" / "opencode" / "service.json"
+            if config.is_file():
+                import json as _json_module
+
+                password = str(
+                    _json_module.loads(config.read_text(encoding="utf-8")).get("password") or ""
+                )
+                if password:
+                    safe = safe.replace(password, "***REDACTED***")
+        except Exception:
+            pass
+    return safe
 
 
 class VoiceStore:
@@ -244,8 +269,54 @@ class VoiceStore:
             )
             """
         )
+        # Rich local notebook for OpenCode sessions. OpenCode's own DB remains the
+        # source of truth; this table only holds speakable metadata, never code.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS opencode_sessions (
+                opencode_session_id VARCHAR PRIMARY KEY,
+                short_code VARCHAR NOT NULL,
+                project_id VARCHAR,
+                worktree_dir VARCHAR,
+                status VARCHAR NOT NULL,
+                end_reason VARCHAR,
+                resume_anchor VARCHAR,
+                mode VARCHAR,
+                agent VARCHAR,
+                model_provider VARCHAR,
+                model_id VARCHAR,
+                voice_session_id VARCHAR,
+                title VARCHAR,
+                last_request VARCHAR,
+                summary VARCHAR,
+                one_line_recap VARCHAR,
+                files_changed TEXT,
+                milestones TEXT,
+                review_state VARCHAR,
+                pending_permission_id VARCHAR,
+                pending_permission_action VARCHAR,
+                pending_permission_resources TEXT,
+                pending_permission_message VARCHAR,
+                pending_expires_at TIMESTAMPTZ,
+                tokens_input INTEGER DEFAULT 0,
+                tokens_output INTEGER DEFAULT 0,
+                cost DOUBLE DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                ended_at TIMESTAMPTZ,
+                metadata TEXT
+            )
+            """
+        )
+        self._migrate_opencode_sessions()
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS messages_session_idx ON messages(session_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS opencode_sessions_code_idx ON opencode_sessions(short_code)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS opencode_sessions_updated_idx ON opencode_sessions(updated_at)"
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS messages_created_idx ON messages(created_at)"
@@ -271,6 +342,36 @@ class VoiceStore:
                     self._vectors_available = False
                     return
         self._vectors_available = True
+
+    def _migrate_opencode_sessions(self) -> None:
+        """Add columns introduced after the first bridge release, if missing."""
+        columns = {
+            str(row.get("name") or row.get("column_name") or "")
+            for row in self._rows("PRAGMA table_info('opencode_sessions')")
+        }
+        additions = {
+            "review_state": "VARCHAR",
+            "pending_permission_id": "VARCHAR",
+            "pending_permission_action": "VARCHAR",
+            "pending_permission_resources": "TEXT",
+            "pending_permission_message": "VARCHAR",
+            "pending_expires_at": "TIMESTAMPTZ",
+            "resume_anchor": "VARCHAR",
+            "one_line_recap": "VARCHAR",
+            "milestones": "TEXT",
+            "tokens_input": "INTEGER DEFAULT 0",
+            "tokens_output": "INTEGER DEFAULT 0",
+            "cost": "DOUBLE DEFAULT 0",
+        }
+        for name, sql_type in additions.items():
+            if name not in columns:
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE opencode_sessions ADD COLUMN {name} {sql_type}"
+                    )
+                    logger.info(f"Added opencode_sessions.{name} during migration")
+                except Exception as exc:
+                    logger.error(f"Could not migrate opencode_sessions.{name}: {exc}")
 
     def _rebuild_indexes(self) -> None:
         # Rebuild normal indexes too. A force-killed backend can leave a stale
@@ -960,6 +1061,205 @@ class VoiceStore:
             except Exception as exc:
                 logger.opt(exception=exc).error("Could not complete reminder")
                 return False
+
+    # ------------------------------------------------------- opencode sessions
+
+    _OPENCODE_FIELDS = (
+        "opencode_session_id",
+        "short_code",
+        "project_id",
+        "worktree_dir",
+        "status",
+        "end_reason",
+        "resume_anchor",
+        "mode",
+        "agent",
+        "model_provider",
+        "model_id",
+        "voice_session_id",
+        "title",
+        "last_request",
+        "summary",
+        "one_line_recap",
+        "files_changed",
+        "milestones",
+        "review_state",
+        "pending_permission_id",
+        "pending_permission_action",
+        "pending_permission_resources",
+        "pending_permission_message",
+        "pending_expires_at",
+        "tokens_input",
+        "tokens_output",
+        "cost",
+        "created_at",
+        "updated_at",
+        "ended_at",
+        "metadata",
+    )
+
+    @classmethod
+    def _opencode_payload(cls, record: dict[str, Any]) -> dict[str, Any]:
+        now = _utcnow()
+        payload = {field: record.get(field) for field in cls._OPENCODE_FIELDS}
+        payload["created_at"] = payload.get("created_at") or now
+        payload["updated_at"] = payload.get("updated_at") or now
+        for field in ("files_changed", "milestones", "metadata"):
+            value = payload.get(field)
+            if value is not None and not isinstance(value, str):
+                payload[field] = _json(value)
+        return payload
+
+    async def upsert_opencode_session(self, record: dict[str, Any]) -> None:
+        """Insert or refresh one speakable OpenCode session notebook row."""
+        session_id = str(record.get("opencode_session_id") or "").strip()
+        if not self._available or not session_id:
+            return
+        payload = self._opencode_payload(record)
+        payload["opencode_session_id"] = session_id
+        columns = list(payload)
+        updates = [
+            f"{name} = COALESCE(excluded.{name}, opencode_sessions.{name})"
+            for name in columns
+            if name not in {"opencode_session_id", "created_at"}
+        ]
+        sql = (
+            f"INSERT INTO opencode_sessions ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)}) "
+            f"ON CONFLICT (opencode_session_id) DO UPDATE SET {', '.join(updates)}"
+        )
+        async with self._lock:
+            try:
+                self._execute(sql, [payload[name] for name in columns])
+            except Exception as exc:
+                logger.opt(exception=exc).error(
+                    f"Could not upsert OpenCode session {session_id[:24]}"
+                )
+
+    async def get_opencode_session(self, key: str) -> dict[str, Any] | None:
+        """Look up by full id, spoken short code, id prefix, or title fragment."""
+        if not self._available or not key:
+            return None
+        needle = str(key).strip()
+        async with self._lock:
+            try:
+                for sql, params in (
+                    (
+                        "SELECT * FROM opencode_sessions WHERE opencode_session_id = ? LIMIT 1",
+                        [needle],
+                    ),
+                    (
+                        "SELECT * FROM opencode_sessions WHERE lower(short_code) = lower(?) LIMIT 1",
+                        [needle],
+                    ),
+                    (
+                        "SELECT * FROM opencode_sessions WHERE opencode_session_id LIKE ? LIMIT 1",
+                        [f"{needle}%"],
+                    ),
+                    (
+                        "SELECT * FROM opencode_sessions WHERE lower(title) LIKE ? "
+                        "ORDER BY updated_at DESC LIMIT 1",
+                        [f"%{needle.lower()}%"],
+                    ),
+                ):
+                    rows = self._rows(sql, params)
+                    if rows:
+                        return rows[0]
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not read OpenCode session")
+        return None
+
+    async def list_opencode_sessions(
+        self,
+        limit: int = 10,
+        status: str | None = None,
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self._available:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if search:
+            clauses.append(
+                "(lower(title) LIKE ? OR lower(last_request) LIKE ? "
+                "OR lower(short_code) LIKE ? OR lower(worktree_dir) LIKE ?)"
+            )
+            term = f"%{search.lower().strip()}%"
+            params.extend([term, term, term, term])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit), 50)))
+        async with self._lock:
+            try:
+                return self._rows(
+                    f"SELECT * FROM opencode_sessions {where} "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    params,
+                )
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not list OpenCode sessions")
+                return []
+
+    async def set_opencode_permission(
+        self,
+        session_id: str,
+        request_id: str,
+        action: str,
+        resources: list[str],
+        message: str,
+        expires_at: datetime,
+    ) -> None:
+        if not self._available or not session_id:
+            return
+        async with self._lock:
+            try:
+                self._execute(
+                    """
+                    UPDATE opencode_sessions
+                    SET pending_permission_id = ?, pending_permission_action = ?,
+                        pending_permission_resources = ?, pending_permission_message = ?,
+                        pending_expires_at = ?, status = 'awaiting_approval',
+                        updated_at = ?
+                    WHERE opencode_session_id = ?
+                    """,
+                    [
+                        request_id,
+                        action[:80],
+                        _json(resources[:20]),
+                        message[:500],
+                        expires_at,
+                        _utcnow(),
+                        session_id,
+                    ],
+                )
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not store pending approval")
+
+    async def clear_opencode_permission(
+        self, session_id: str, *, status: str | None = None
+    ) -> None:
+        if not self._available or not session_id:
+            return
+        async with self._lock:
+            try:
+                self._execute(
+                    """
+                    UPDATE opencode_sessions
+                    SET pending_permission_id = NULL,
+                        pending_permission_action = NULL,
+                        pending_permission_resources = NULL,
+                        pending_permission_message = NULL,
+                        pending_expires_at = NULL,
+                        status = COALESCE(?, status),
+                        updated_at = ?
+                    WHERE opencode_session_id = ?
+                    """,
+                    [status, _utcnow(), session_id],
+                )
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not clear pending approval")
 
     # --------------------------------------------------------------------- errors
 

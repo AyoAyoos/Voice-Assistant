@@ -8,12 +8,13 @@ result callback, even on failure, so a tool call can never stall a voice turn.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import re
 import socket
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -25,10 +26,13 @@ from pipecat.services.llm_service import FunctionCallParams
 
 from storage import embeddings as embedding_service
 from storage.duckdb_store import store
+from tools.opencode_client import OpenCodeError, opencode_client
 
 _WEB_TIMEOUT = 8.0
 _MAX_RESULT_CHARS = 4000
 _web_client: httpx.AsyncClient | None = None
+# request_id -> timer task. A missing spoken answer always rejects the request.
+_approval_timers: dict[str, asyncio.Task] = {}
 
 
 async def get_web_client() -> httpx.AsyncClient:
@@ -439,6 +443,725 @@ async def get_system_info(params: FunctionCallParams) -> None:
     await _safe_call(params, handler)
 
 
+# ------------------------------------------------------------- OpenCode bridge
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _short_code(session_id: str) -> str:
+    return str(session_id or "")[-8:]
+
+
+def _clean_text(value: Any, limit: int = 600) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _decode_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        decoded = json.loads(str(value))
+        return decoded if isinstance(decoded, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _timestamp(value: Any) -> datetime | None:
+    """OpenCode time fields are epoch milliseconds."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return datetime.fromtimestamp(number / 1000, timezone.utc)
+
+
+async def _fetch_resilient(coro_factory, *, attempts: int = 3):
+    """Retry short transient OpenCode 500s while a turn is still settling."""
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await coro_factory()
+        except OpenCodeError as exc:
+            last_error = exc
+            if "500" not in str(exc) or attempt == attempts - 1:
+                raise
+            await asyncio.sleep(0.5 * (attempt + 1))
+    raise last_error or OpenCodeError("OpenCode request failed.")
+
+
+def _record_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    record = dict(row)
+    for field in ("files_changed", "milestones"):
+        record[field] = _decode_list(record.get(field))
+    return record
+
+
+def _permission_question(permission: dict[str, Any]) -> str:
+    action = _clean_text(permission.get("action"), 60) or "an action"
+    resources = permission.get("resources") or []
+    resource = _clean_text(resources[0] if resources else "that resource", 160)
+    message = _clean_text(permission.get("message"), 220)
+    lead = message or "OpenCode is asking for approval"
+    return f"{lead} for {action} on {resource}. Should I allow it once?"
+
+
+def _cancel_approval_timer(request_id: str) -> None:
+    task = _approval_timers.pop(request_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def cancel_approval_timers() -> None:
+    """Cancel pending default-reject timers during backend shutdown."""
+    for task in list(_approval_timers.values()):
+        if not task.done():
+            task.cancel()
+    _approval_timers.clear()
+
+
+async def _reject_expired_permission(
+    session_id: str, request_id: str, expires_at: datetime
+) -> None:
+    """Default rejection when the user never answers a spoken approval question."""
+    try:
+        delay = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
+        if delay:
+            await asyncio.sleep(delay)
+        row = await store.get_opencode_session(session_id)
+        if not row or str(row.get("pending_permission_id") or "") != request_id:
+            return
+        try:
+            pending = await opencode_client.pending_permissions(session_id)
+        except OpenCodeError:
+            pending = []
+        if not any(str(item.get("id") or "") == request_id for item in pending):
+            await store.clear_opencode_permission(session_id, status="running")
+            return
+        try:
+            await opencode_client.reply_permission(session_id, request_id, "reject")
+        except OpenCodeError as exc:
+            logger.warning(f"Could not auto-reject expired approval: {_safe_bridge_error(exc)}")
+        await store.clear_opencode_permission(session_id, status="interrupted")
+        await store.upsert_opencode_session(
+            {
+                "opencode_session_id": session_id,
+                "status": "interrupted",
+                "end_reason": "Approval timed out",
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"Approval timeout handler failed: {_safe_bridge_error(exc)}")
+    finally:
+        _approval_timers.pop(request_id, None)
+
+
+async def _store_pending_permission(
+    session_id: str, permission: dict[str, Any]
+) -> datetime:
+    request_id = str(permission.get("id") or "")
+    resources = [str(item) for item in (permission.get("resources") or [])]
+    expires = datetime.now(timezone.utc) + timedelta(
+        seconds=_env_float("OPENCODE_APPROVAL_TIMEOUT_SECONDS", 60)
+    )
+    await store.set_opencode_permission(
+        session_id,
+        request_id,
+        str(permission.get("action") or ""),
+        resources,
+        str(permission.get("message") or ""),
+        expires,
+    )
+    if request_id:
+        _cancel_approval_timer(request_id)
+        task = asyncio.create_task(
+            _reject_expired_permission(session_id, request_id, expires),
+            name=f"opencode-approval-{request_id[-8:]}",
+        )
+        _approval_timers[request_id] = task
+    return expires
+
+
+def _assistant_text(messages: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        if message.get("type") != "assistant":
+            continue
+        for content in message.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "text":
+                text = _clean_text(content.get("text"), 1200)
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _summarize_messages(
+    messages: list[dict[str, Any]], diffs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    last_user = next((msg for msg in messages if msg.get("type") == "user"), None)
+    idle = next((msg for msg in messages if msg.get("type") == "idle"), None)
+    summary = _assistant_text(messages)
+    error = next(
+        (
+            _clean_text(msg.get("error"), 300)
+            for msg in messages
+            if msg.get("type") == "assistant" and msg.get("error")
+        ),
+        "",
+    )
+    if not summary and error:
+        summary = f"OpenCode reported an error: {error}"
+    if not summary:
+        summary = "The task finished without a written summary."
+    files: list[str] = []
+    additions = 0
+    deletions = 0
+    for diff in diffs:
+        name = _clean_text(diff.get("file"), 200)
+        if name:
+            files.append(name)
+        try:
+            additions += int(diff.get("additions") or 0)
+            deletions += int(diff.get("deletions") or 0)
+        except (TypeError, ValueError):
+            pass
+    if idle and str(idle.get("outcome") or "") in {"failed", "interrupted"}:
+        summary = f"OpenCode ended with {idle.get('outcome')}. {summary}"[:1200]
+    first_sentence = re.split(r"(?<=[.!?])\s+", summary, maxsplit=1)[0][:220]
+    milestones: list[str] = []
+    if files:
+        milestones.append(f"{len(files)} file{'s' if len(files) != 1 else ''} changed")
+    if additions or deletions:
+        milestones.append(f"{additions} additions, {deletions} deletions")
+    if error:
+        milestones.append("an error was reported")
+    return {
+        "last_request": _clean_text(last_user.get("text"), 500) if last_user else None,
+        "resume_anchor": str(last_user.get("id") or "") if last_user else None,
+        "summary": summary[:1200],
+        "one_line_recap": first_sentence,
+        "files_changed": files[:40],
+        "milestones": milestones,
+        "outcome": str((idle or {}).get("outcome") or "") or None,
+        "error": error,
+    }
+
+
+async def _record_from_opencode(info: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
+    session_id = str(info.get("id") or "")
+    location = info.get("location") or {}
+    directory = str(location.get("directory") or opencode_client.project_dir)
+    model = info.get("model") or {}
+    timestamps = info.get("time") or {}
+    now = datetime.now(timezone.utc)
+    outcome = info.get("outcome")
+    status = "succeeded" if outcome == "succeeded" else (
+        "failed" if outcome == "failed" else ("interrupted" if outcome == "interrupted" else "idle")
+    )
+    return {
+        "opencode_session_id": session_id,
+        "short_code": _short_code(session_id),
+        "project_id": str(info.get("projectID") or ""),
+        "worktree_dir": directory,
+        "status": status,
+        "end_reason": outcome,
+        "agent": str(info.get("agent") or "") or None,
+        "model_provider": str(model.get("providerID") or "") or None,
+        "model_id": str(model.get("id") or "") or None,
+        "mode": mode or "read",
+        "title": _clean_text(info.get("title"), 120) or f"OpenCode session {_short_code(session_id)}",
+        "review_state": "unreviewed",
+        "created_at": _timestamp(timestamps.get("created")) or now,
+        "updated_at": _timestamp(timestamps.get("updated")) or now,
+        "metadata": {"source": "opencode-api"},
+    }
+
+
+async def _resolve_record(key: str) -> dict[str, Any] | None:
+    row = await store.get_opencode_session(key)
+    if row:
+        return _record_from_row(row)
+    try:
+        info = await opencode_client.get_session(key)
+    except OpenCodeError:
+        return None
+    if not info.get("id"):
+        return None
+    record = await _record_from_opencode(info)
+    await store.upsert_opencode_session(record)
+    return record
+
+
+async def _finalize_record(
+    record: dict[str, Any], terminal: dict[str, Any] | None, *, fetch: bool = True
+) -> dict[str, Any]:
+    """Refresh speakable metadata from OpenCode and persist the local notebook."""
+    session_id = str(record.get("opencode_session_id") or "")
+    terminal = terminal or {}
+    status = terminal.get("status")
+    if status in {"succeeded", "idle"}:
+        status = "succeeded"
+    elif status in {"failed", "interrupted"}:
+        pass
+    elif status in {"permission", "timeout"}:
+        status = "running"
+    else:
+        status = str(record.get("status") or "running")
+    end_reason = _clean_text(
+        terminal.get("error") or terminal.get("reason") or record.get("end_reason"), 300
+    ) or None
+    updated = dict(record)
+    updated["status"] = status
+    updated["end_reason"] = end_reason
+    updated["updated_at"] = datetime.now(timezone.utc)
+    if status in {"succeeded", "failed", "interrupted"}:
+        updated["ended_at"] = updated["updated_at"]
+        await store.clear_opencode_permission(session_id, status=status)
+    if fetch:
+        await asyncio.sleep(0.3)  # let the OpenCode projection settle first
+        try:
+            info = await _fetch_resilient(lambda: opencode_client.get_session(session_id))
+            if info:
+                model = info.get("model") or {}
+                tokens = info.get("tokens") or {}
+                updated["agent"] = str(info.get("agent") or updated.get("agent") or "") or None
+                updated["model_provider"] = str(model.get("providerID") or updated.get("model_provider") or "") or None
+                updated["model_id"] = str(model.get("id") or updated.get("model_id") or "") or None
+                updated["title"] = _clean_text(info.get("title"), 120) or updated.get("title")
+                try:
+                    updated["tokens_input"] = int(tokens.get("input") or 0)
+                    updated["tokens_output"] = int(tokens.get("output") or 0)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    updated["cost"] = float(info.get("cost") or 0)
+                except (TypeError, ValueError):
+                    pass
+        except OpenCodeError as exc:
+            logger.warning(f"Could not refresh OpenCode session info: {_safe_bridge_error(exc)}")
+        try:
+            messages = await _fetch_resilient(
+                lambda: opencode_client.messages(session_id, limit=50)
+            )
+            diffs = await _fetch_resilient(lambda: opencode_client.diff(session_id))
+            summary = _summarize_messages(messages, diffs)
+            if summary["last_request"]:
+                updated["last_request"] = summary["last_request"]
+            if summary["resume_anchor"]:
+                updated["resume_anchor"] = summary["resume_anchor"]
+            updated["summary"] = summary["summary"]
+            updated["one_line_recap"] = summary["one_line_recap"]
+            updated["files_changed"] = summary["files_changed"]
+            updated["milestones"] = summary["milestones"]
+            if summary["outcome"] and status == "running":
+                updated["status"] = summary["outcome"]
+                status = summary["outcome"]
+        except OpenCodeError as exc:
+            logger.warning(f"Could not summarize OpenCode session: {_safe_bridge_error(exc)}")
+    if updated.get("files_changed") and status in {"succeeded", "running"}:
+        updated["review_state"] = updated.get("review_state") or "unreviewed"
+    await store.upsert_opencode_session(updated)
+    return updated
+
+
+def _safe_bridge_error(exc: Exception) -> str:
+    text = str(exc)
+    values = [
+        os.getenv(name, "").strip()
+        for name in ("OPENCODE_SERVICE_PASSWORD", "GEMINI_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY")
+    ]
+    try:
+        values.append(opencode_client._service_password())
+    except Exception:
+        pass
+    for value in values:
+        if value:
+            text = text.replace(value, "***REDACTED***")
+    return text[:250]
+
+
+def _session_payload(record: dict[str, Any], status: str | None = None) -> dict[str, Any]:
+    return {
+        "status": status or record.get("status") or "unknown",
+        "short_code": record.get("short_code") or _short_code(str(record.get("opencode_session_id") or "")),
+        "session_id": record.get("opencode_session_id"),
+        "title": record.get("title"),
+        "mode": record.get("mode"),
+        "summary": _clean_text(record.get("summary"), 900) or None,
+        "recap": _clean_text(record.get("one_line_recap"), 300) or None,
+        "file_count": len(_decode_list(record.get("files_changed"))),
+        "files_changed": _decode_list(record.get("files_changed"))[:12],
+        "milestones": _decode_list(record.get("milestones"))[:6],
+        "worktree": record.get("worktree_dir"),
+        "review_state": record.get("review_state"),
+        "end_reason": record.get("end_reason"),
+    }
+
+
+async def _background_finalize(
+    record: dict[str, Any], baseline: dict[str, Any] | None = None
+) -> None:
+    """Finish a long task after the voice turn has already been released."""
+    try:
+        terminal = await opencode_client.wait_for_terminal(
+            str(record["opencode_session_id"]),
+            _env_float("OPENCODE_TASK_TIMEOUT_SECONDS", 300),
+            baseline=baseline,
+        )
+        if terminal.get("status") == "permission":
+            await _store_pending_permission(
+                str(record["opencode_session_id"]), terminal.get("permission") or {}
+            )
+            return
+        await _finalize_record(record, terminal)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"Background OpenCode finalizer failed: {_safe_bridge_error(exc)}")
+
+
+async def code_task(params: FunctionCallParams) -> None:
+    text = str(params.arguments.get("text") or "").strip()
+    session_key = str(params.arguments.get("session") or "").strip() or None
+    mode = str(params.arguments.get("mode") or "read").strip().lower()
+    if mode not in {"read", "plan", "build"}:
+        mode = "read"
+    model_ref = str(params.arguments.get("model") or "").strip() or None
+    title = str(params.arguments.get("title") or "").strip() or text[:80]
+
+    async def handler() -> None:
+        if not text:
+            await params.result_callback(
+                {"error": "Please tell me what the coding task should do."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        try:
+            healthy = await opencode_client.health()
+            if not healthy:
+                raise OpenCodeError("The OpenCode service is not running.")
+            record: dict[str, Any] | None = None
+            if session_key:
+                record = await _resolve_record(session_key)
+                if not record:
+                    raise OpenCodeError("I could not find that OpenCode session.")
+                session_id = str(record["opencode_session_id"])
+                directory = str(record.get("worktree_dir") or opencode_client.project_dir)
+                agent = str(record.get("agent") or "") or await opencode_client.pick_agent(mode, directory)
+            else:
+                directory = await opencode_client.create_worktree()
+                agent = await opencode_client.pick_agent(mode, directory)
+                info = await opencode_client.create_session(
+                    directory=directory,
+                    agent=agent,
+                    title=title,
+                    mode=mode,
+                    model_ref=model_ref,
+                )
+                session_id = str(info["id"])
+                record = await _record_from_opencode(info, mode=mode)
+                record["worktree_dir"] = directory
+                await store.upsert_opencode_session(record)
+            baseline = (await opencode_client.session_state(session_id)).get("baseline") or {}
+            terminal = await opencode_client.prompt_and_wait(
+                session_id,
+                text,
+                _env_float("OPENCODE_TASK_WAIT_SECONDS", 45),
+                metadata={"voice_source": "voice-assistant", "voice_mode": mode},
+                baseline=baseline,
+            )
+            if terminal.get("status") == "permission":
+                permission = terminal.get("permission") or {}
+                await _store_pending_permission(session_id, permission)
+                await params.result_callback(
+                    {
+                        "status": "awaiting_approval",
+                        "question": _permission_question(permission),
+                        "short_code": _short_code(session_id),
+                        "session_id": session_id,
+                        "request_id": str(permission.get("id") or ""),
+                    },
+                    properties=FunctionCallResultProperties(run_llm=True),
+                )
+                return
+            if terminal.get("status") in {"timeout", "running"}:
+                asyncio.create_task(
+                    _background_finalize(record, baseline),
+                    name=f"opencode-finalize-{_short_code(session_id)}",
+                )
+                await params.result_callback(
+                    {
+                        "status": "running",
+                        "short_code": _short_code(session_id),
+                        "session_id": session_id,
+                        "mode": mode,
+                        "worktree": directory,
+                        "message": "The task is still running. Ask me for a recap when you want the result.",
+                    },
+                    properties=FunctionCallResultProperties(run_llm=True),
+                )
+                return
+            updated = await _finalize_record(record, terminal)
+            await params.result_callback(
+                _session_payload(updated, "completed" if updated.get("status") == "succeeded" else updated.get("status")),
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+        except OpenCodeError as exc:
+            message = _safe_bridge_error(exc)
+            logger.warning(f"code_task failed: {message}")
+            await params.result_callback(
+                {"error": message}, properties=FunctionCallResultProperties(run_llm=True)
+            )
+
+    await _safe_call(params, handler)
+
+
+async def list_code_sessions(params: FunctionCallParams) -> None:
+    async def handler() -> None:
+        limit = _coerce_limit(params.arguments.get("limit"), 8, 20)
+        status = str(params.arguments.get("status") or "").strip() or None
+        search = str(params.arguments.get("search") or "").strip() or None
+        try:
+            healthy = await opencode_client.health()
+        except OpenCodeError:
+            healthy = False
+        if healthy:
+            try:
+                api_sessions = await opencode_client.list_sessions(
+                    directory=opencode_client.project_dir, limit=limit
+                )
+                known = {
+                    str(row.get("opencode_session_id") or "")
+                    for row in await store.list_opencode_sessions(limit=50)
+                }
+                for info in api_sessions:
+                    sid = str(info.get("id") or "")
+                    if sid and sid not in known:
+                        record = await _record_from_opencode(info)
+                        await store.upsert_opencode_session(record)
+            except OpenCodeError as exc:
+                logger.warning(f"Could not sync OpenCode session list: {_safe_bridge_error(exc)}")
+        rows = await store.list_opencode_sessions(limit=limit, status=status, search=search)
+        sessions = [
+            {
+                "short_code": row.get("short_code") or _short_code(str(row.get("opencode_session_id") or "")),
+                "title": _clean_text(row.get("title"), 100),
+                "status": row.get("status"),
+                "mode": row.get("mode"),
+                "recap": _clean_text(row.get("one_line_recap"), 220) or None,
+                "updated": str(row.get("updated_at") or "")[:19],
+                "review_state": row.get("review_state"),
+                "worktree": row.get("worktree_dir"),
+            }
+            for row in rows
+        ]
+        await params.result_callback(
+            {"sessions": sessions, "count": len(sessions)},
+            properties=FunctionCallResultProperties(run_llm=True),
+        )
+
+    await _safe_call(params, handler)
+
+
+async def recap_code_session(params: FunctionCallParams) -> None:
+    session_key = str(params.arguments.get("session") or "").strip() or None
+    include_details = bool(params.arguments.get("include_details"))
+
+    async def handler() -> None:
+        key = session_key
+        if not key:
+            rows = await store.list_opencode_sessions(limit=1)
+            key = str(rows[0].get("opencode_session_id") or "") if rows else ""
+        if not key:
+            await params.result_callback(
+                {"error": "I do not have any OpenCode sessions to recap yet."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        record = await _resolve_record(key)
+        if not record:
+            await params.result_callback(
+                {"error": "I could not find that OpenCode session."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        if record.get("pending_expires_at"):
+            try:
+                expires = datetime.fromisoformat(str(record["pending_expires_at"]))
+                if expires.tzinfo is None:
+                    expires = expires.astimezone()
+                if expires < datetime.now(timezone.utc):
+                    await store.clear_opencode_permission(
+                        str(record["opencode_session_id"]), status="running"
+                    )
+                    record["status"] = "running"
+            except ValueError:
+                pass
+        updated = await _finalize_record(record, {})
+        payload = _session_payload(updated)
+        payload["last_request"] = _clean_text(updated.get("last_request"), 400) or None
+        payload["pending_approval"] = bool(updated.get("pending_permission_id"))
+        if include_details:
+            payload["details"] = {
+                "files_changed": _decode_list(updated.get("files_changed"))[:30],
+                "milestones": _decode_list(updated.get("milestones"))[:10],
+                "resume_anchor": updated.get("resume_anchor"),
+                "agent": updated.get("agent"),
+                "model": f"{updated.get('model_provider') or ''}/{updated.get('model_id') or ''}".strip("/"),
+            }
+        await params.result_callback(
+            payload, properties=FunctionCallResultProperties(run_llm=True)
+        )
+
+    await _safe_call(params, handler)
+
+
+async def code_permission_reply(params: FunctionCallParams) -> None:
+    raw_decision = str(params.arguments.get("decision") or "").strip().lower()
+    decision = "once" if raw_decision in {"yes", "allow", "approve", "ok", "okay"} else (
+        "reject" if raw_decision in {"no", "deny", "stop", "cancel"} else raw_decision
+    )
+    request_id = str(params.arguments.get("request_id") or "").strip() or None
+    session_key = str(params.arguments.get("session") or "").strip() or None
+
+    async def handler() -> None:
+        if decision not in {"once", "always", "reject"}:
+            await params.result_callback(
+                {"error": "Please answer yes or no to the approval question."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        record: dict[str, Any] | None = None
+        if session_key:
+            record = await _resolve_record(session_key)
+        candidates = [
+            _record_from_row(row)
+            for row in await store.list_opencode_sessions(
+                limit=20, status="awaiting_approval"
+            )
+        ]
+        if request_id:
+            record = next(
+                (
+                    item
+                    for item in candidates
+                    if str(item.get("pending_permission_id") or "") == request_id
+                ),
+                record,
+            )
+        elif record is None or not record.get("pending_permission_id"):
+            record = candidates[0] if candidates else None
+        if not record or not record.get("pending_permission_id"):
+            await params.result_callback(
+                {"status": "no_pending", "message": "There is no approval waiting right now."},
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        pending_id = request_id or str(record["pending_permission_id"])
+        session_id = str(record["opencode_session_id"])
+        expires_raw = record.get("pending_expires_at")
+        if expires_raw:
+            try:
+                expires = datetime.fromisoformat(str(expires_raw))
+                if expires.tzinfo is None:
+                    expires = expires.astimezone()
+                if expires < datetime.now(timezone.utc):
+                    _cancel_approval_timer(pending_id)
+                    try:
+                        await opencode_client.reply_permission(
+                            session_id, pending_id, "reject"
+                        )
+                    except OpenCodeError as exc:
+                        logger.debug(f"Expired approval was already closed: {_safe_bridge_error(exc)}")
+                    await store.clear_opencode_permission(
+                        session_id, status="interrupted"
+                    )
+                    await store.upsert_opencode_session(
+                        {
+                            "opencode_session_id": session_id,
+                            "status": "interrupted",
+                            "end_reason": "Approval timed out",
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    )
+                    await params.result_callback(
+                        {
+                            "status": "expired",
+                            "message": "That approval timed out, so I rejected it by default.",
+                        },
+                        properties=FunctionCallResultProperties(run_llm=True),
+                    )
+                    return
+            except ValueError:
+                pass
+        _cancel_approval_timer(pending_id)
+        baseline = (await opencode_client.session_state(session_id)).get("baseline") or {}
+        await opencode_client.reply_permission(session_id, pending_id, decision)
+        await store.clear_opencode_permission(
+            session_id, status="interrupted" if decision == "reject" else "running"
+        )
+        if decision == "reject":
+            await params.result_callback(
+                {
+                    "status": "rejected",
+                    "short_code": _short_code(session_id),
+                    "message": "I rejected that request. Nothing was changed by it.",
+                },
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        terminal = await opencode_client.wait_for_terminal(
+            session_id, _env_float("OPENCODE_TASK_WAIT_SECONDS", 45), baseline=baseline
+        )
+        if terminal.get("status") == "permission":
+            permission = terminal.get("permission") or {}
+            await _store_pending_permission(session_id, permission)
+            await params.result_callback(
+                {
+                    "status": "awaiting_approval",
+                    "question": _permission_question(permission),
+                    "short_code": _short_code(session_id),
+                    "session_id": session_id,
+                    "request_id": str(permission.get("id") or ""),
+                },
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        if terminal.get("status") in {"timeout", "running"}:
+            asyncio.create_task(
+                _background_finalize(record, baseline),
+                name=f"opencode-finalize-{_short_code(session_id)}",
+            )
+            await params.result_callback(
+                {
+                    "status": "running",
+                    "short_code": _short_code(session_id),
+                    "message": "Approved. The task is still running; ask me for a recap in a moment.",
+                },
+                properties=FunctionCallResultProperties(run_llm=True),
+            )
+            return
+        updated = await _finalize_record(record, terminal)
+        await params.result_callback(
+            _session_payload(updated, "completed" if updated.get("status") == "succeeded" else updated.get("status")),
+            properties=FunctionCallResultProperties(run_llm=True),
+        )
+
+    await _safe_call(params, handler)
+
+
 # ----------------------------------------------------------- end conversation
 
 
@@ -591,6 +1314,106 @@ def build_tool_schemas(worker_getter) -> list[FunctionSchema]:
             properties={},
             required=[],
             handler=get_system_info,
+        ),
+        FunctionSchema(
+            name="code_task",
+            description=(
+                "Ask the already-running OpenCode coding service to do a read-only, plan, or "
+                "build task in an isolated git worktree. Use this when the user wants code "
+                "explored, planned, or changed. Always summarise the result by voice; never "
+                "read code or diffs aloud. The returned short_code is how the user refers to "
+                "the session later. If the result says awaiting_approval, ask the user yes or "
+                "no and then call code_permission_reply."
+            ),
+            properties={
+                "text": {
+                    "type": "string",
+                    "description": "The full coding task in the user's own words.",
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "read, plan, or build. Defaults to read. Build can edit the isolated worktree.",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Optional short_code or session id to continue an earlier task.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional OpenCode model such as ollama/qwen2.5:3b-instruct. Any available model is allowed.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional short title for the session notebook.",
+                },
+            },
+            required=["text"],
+            handler=code_task,
+        ),
+        FunctionSchema(
+            name="list_code_sessions",
+            description=(
+                "List the user's OpenCode coding sessions with their short codes, titles, "
+                "status, and one-line recaps. Use when the user asks what coding tasks exist "
+                "or wants to pick one to resume."
+            ),
+            properties={
+                "limit": {"type": "integer", "description": "Maximum sessions (1-20). Defaults to 8."},
+                "status": {
+                    "type": "string",
+                    "description": "Optional status filter such as running or succeeded.",
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Optional words to match in title, request, short code, or worktree.",
+                },
+            },
+            required=[],
+            handler=list_code_sessions,
+        ),
+        FunctionSchema(
+            name="recap_code_session",
+            description=(
+                "Give a spoken recap of an OpenCode session: what was asked, what changed, "
+                "file names and counts, review state, and the worktree path. Never includes "
+                "raw code or patches. Omit the session to recap the most recent one."
+            ),
+            properties={
+                "session": {
+                    "type": "string",
+                    "description": "Optional short_code, full session id, or title words.",
+                },
+                "include_details": {
+                    "type": "boolean",
+                    "description": "Set true only when the user explicitly asks for file-level detail.",
+                },
+            },
+            required=[],
+            handler=recap_code_session,
+        ),
+        FunctionSchema(
+            name="code_permission_reply",
+            description=(
+                "Answer a spoken approval question from OpenCode after code_task reports "
+                "awaiting_approval. Use yes/once to allow that single action, or no/reject to "
+                "decline. If the user does not answer, the request is rejected by default."
+            ),
+            properties={
+                "decision": {
+                    "type": "string",
+                    "description": "yes or once to allow; no or reject to decline.",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Optional short_code or session id of the pending approval.",
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "Optional permission request id from the awaiting_approval result.",
+                },
+            },
+            required=["decision"],
+            handler=code_permission_reply,
         ),
         FunctionSchema(
             name="end_conversation",

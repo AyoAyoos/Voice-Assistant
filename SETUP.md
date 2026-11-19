@@ -91,6 +91,13 @@ Other defaults that usually need no change:
 | `LOCAL_STT_MODEL` | `small.en` | faster-whisper model for offline STT |
 | `LOCAL_LLM_MODEL` | `qwen2.5:3b-instruct` | Ollama chat model for offline LLM |
 | `LOCAL_TTS_VOICE` | `en_US-lessac-medium` | Piper voice for offline TTS |
+| `OPENCODE_BASE_URL` | `http://127.0.0.1:28894` | Loopback-only coding service; no second agent is started |
+| `OPENCODE_SERVICE_PASSWORD` | empty | Backend-only password; empty reads `~/.config/opencode/service.json` |
+| `OPENCODE_PROJECT_DIR` | `D:\voice-assistant` | Live checkout used to resolve the OpenCode project id |
+| `OPENCODE_WORKTREE_ROOT` | `D:\voice-assistant-worktrees` | Worktrees must be outside the project directory |
+| `OPENCODE_TASK_WAIT_SECONDS` | `45` | Maximum wait inside one voice turn before saying "still running" |
+| `OPENCODE_TASK_TIMEOUT_SECONDS` | `300` | Background finalizer deadline for long tasks |
+| `OPENCODE_APPROVAL_TIMEOUT_SECONDS` | `60` | Unanswered approvals are rejected after this many seconds |
 
 Notes:
 
@@ -98,6 +105,8 @@ Notes:
 - If Gemini returns `404` for your memory model, keep `gemini-flash-lite-latest`. The older `gemini-2.5-flash` is no longer available to new keys.
 - Other supported Live model IDs are listed in `.env.example`.
 - `auto` runs a ~1 s Gemini preflight at call start; if it fails, the call uses local models and the assistant says "I'm offline, using local models." once. Set `VOICE_BACKEND=gemini` or `local` to force a mode.
+- The OpenCode bridge is optional and uses the service you already run. Keep `OPENCODE_BASE_URL` on loopback only; the client rejects any other host. Leave `OPENCODE_SERVICE_PASSWORD` empty unless the backend cannot read the local service config. Never paste that password into `.env.example`, docs, logs, or chat.
+- `OPENCODE_WORKTREE_ROOT` must be outside `OPENCODE_PROJECT_DIR`, so voice coding tasks never edit the live checkout. Full behavior and safety rules are in [OPENCODE_BRIDGE.md](OPENCODE_BRIDGE.md).
 
 ---
 
@@ -138,6 +147,39 @@ Pass `--download-dir` explicitly: Piper's downloader otherwise writes to the cur
 > Both downloads contact Hugging Face. If your network resets that connection, set `$env:HF_ENDPOINT = 'https://hf-mirror.com'` in the same PowerShell session before the Whisper command. Piper's downloader hardcodes the Hugging Face host, so if it keeps failing, download `en_US-lessac-medium.onnx` and `en_US-lessac-medium.onnx.json` from `https://hf-mirror.com/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/` into `~/.cache/piper` instead.
 >
 > If the Whisper library still cannot download, fetch `config.json`, `tokenizer.json`, `preprocessor_config.json`, `vocabulary.txt` and `model.bin` from `https://hf-mirror.com/Systran/faster-whisper-small.en/resolve/main/` into any local folder and set `LOCAL_STT_MODEL` in `.env` to that folder's path. `WhisperModel` accepts a directory as well as a model name.
+
+### 5c. Optional: voice-controlled OpenCode bridge
+
+This bridge talks only to the already-running local service. It never launches another coding agent. To enable the four coding tools (`code_task`, `list_code_sessions`, `recap_code_session`, `code_permission_reply`):
+
+1. Confirm the service is running on loopback:
+
+   ```powershell
+   opencode service status
+   ```
+
+2. Install the restricted agents. The repo copies are in `.opencode\agents\`; the running service reads the global copies:
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\opencode\agents" | Out-Null
+   Copy-Item .opencode\agents\*.md "$env:USERPROFILE\.config\opencode\agents\"
+   opencode api location.reload
+   ```
+
+   `GET /api/agent` should list `voice-coder` and `voice-planner`. The repo also ships `.opencode\opencode.jsonc` as defense-in-depth policy for manual sessions.
+
+3. Keep the worktree root outside the checkout. The defaults in `.env.example` are `D:\voice-assistant` and `D:\voice-assistant-worktrees`; the backend refuses unsafe combinations.
+
+4. Verify the bridge with throwaway files:
+
+   ```powershell
+   .\.venv\Scripts\python.exe scripts\verify_opencode_bridge.py
+   .\.venv\Scripts\python.exe scripts\verify_opencode_approval.py
+   ```
+
+   The first script checks a read task, session listing, and recap. The second checks a spoken "yes" and the default rejection of an unanswered approval. Both may leave a worktree locked until OpenCode is restarted on Windows; see [OPENCODE_BRIDGE.md](OPENCODE_BRIDGE.md).
+
+5. In a call, try: "Read this codebase and tell me where reminders are stored", "Plan how to add dark mode", "List my coding sessions", or "Recap session echo bravo tango". For build tasks, answer the spoken approval question with yes or no.
 
 ---
 
@@ -230,8 +272,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scrip
 4. After ending a call, **History & Memory** lists a session with turns.
 5. `data\voice_assistant.duckdb` exists and `logs\errors.log` has no new ERROR entries.
 6. `Ctrl + ;` toggles the compact panel and the backend without manual clicks.
+7. Optional: `opencode service status` points at `127.0.0.1:28894`, and the bridge verification scripts pass. A coding task returns a short code such as `ecvEFlrT`.
 
-If something fails, follow [TROUBLESHOOTING.md](TROUBLESHOOTING.md). For details on the data written, see [STORAGE_AND_MEMORY.md](STORAGE_AND_MEMORY.md).
+If something fails, follow [TROUBLESHOOTING.md](TROUBLESHOOTING.md). For details on the data written, see [STORAGE_AND_MEMORY.md](STORAGE_AND_MEMORY.md). For coding sessions, approvals, models, and cleanup, see [OPENCODE_BRIDGE.md](OPENCODE_BRIDGE.md).
 
 ---
 
@@ -239,14 +282,16 @@ If something fails, follow [TROUBLESHOOTING.md](TROUBLESHOOTING.md). For details
 
 - Toggle the panel with `Ctrl + ;` (or `-Toggle` above). The backend stays warm; the UI is rebuilt only when its sources change, so frontend edits appear on the next press.
 - Keep Ollama running in the background for semantic search, memory vectors, and offline chat.
+- Keep the OpenCode service running if you use the coding bridge; resuming by short code reuses the stored worktree. Build tasks stay in their worktree until you review and clean them up manually.
 - The full page at <http://127.0.0.1:45123/> is the place to browse history, memory facts, reminders and search results.
 - To update the project: `git pull`, then stop and restart via `Ctrl + ;` (and re-run `pip install -r requirements.txt` if dependencies changed).
 
 ## 10. Local files you should never commit
 
 ```text
-.env                         real API key
-data/voice_assistant.duckdb  call history, memory, vectors, errors
+.env                         real API keys and optional OpenCODE_SERVICE_PASSWORD
+data/voice_assistant.duckdb  call history, memory, vectors, errors, coding-session notebook
+D:\voice-assistant-worktrees\  isolated coding worktrees; review before deleting
 logs/errors.log              structured error log
 .voice-hotkey.log            launcher log
 .voice-backend*.log          backend stdout/stderr

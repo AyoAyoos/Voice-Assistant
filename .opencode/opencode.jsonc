@@ -1,0 +1,29 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Defense in depth for manual sessions opened inside D:\voice-assistant.
+  // Voice-created sessions also carry a stricter ruleset in their session
+  // permissions, because voice work happens in a worktree outside this root.
+  // No provider policy is set: all OpenCode models remain available.
+  // .env.example is documentation and stays editable; only real .env secrets
+  // are hard-denied.
+  "policies": [
+    { "action": "tool.use", "resource": "read:*.env", "effect": "deny" },
+    { "action": "tool.use", "resource": "read:*.env.*", "effect": "deny" },
+    { "action": "tool.use", "resource": "read:*.env.example", "effect": "allow" },
+    { "action": "tool.use", "resource": "edit:*.env", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:*.env.*", "effect": "deny" },
+    { "action": "tool.use", "resource": "edit:*.env.example", "effect": "allow" },
+    { "action": "tool.use", "resource": "shell:git push *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:git reset --hard *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:git clean *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:git checkout -- *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:git restore *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:rm *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:del *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:Remove-Item *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:Stop-Process *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:format *", "effect": "deny" },
+    { "action": "tool.use", "resource": "shell:sudo *", "effect": "deny" }
+  ]
+}
