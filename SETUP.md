@@ -4,10 +4,10 @@ This guide takes you from a fresh clone to a working voice assistant with a glob
 
 At the end you will have:
 
-- A FastAPI server on `http://127.0.0.1:8000` talking to the Gemini Live API.
+- A FastAPI server on `http://127.0.0.1:45123` that uses Gemini Live online and falls back to local models when Gemini is unreachable.
 - A React UI that sends microphone audio over WebRTC and plays the reply.
-- A local DuckDB database holding transcripts, memory facts, vectors and errors.
-- A compact bottom-right panel that starts and stops with `Ctrl + ;`.
+- A local DuckDB database holding transcripts, memory facts, vectors, reminders and errors.
+- A compact bottom-right panel toggled with `Ctrl + ;`; the backend stays warm between calls.
 
 > [!IMPORTANT]
 > Everything under `data/`, `logs/`, `.env`, the browser profile and all build output is gitignored. Never commit your API key, call history or local logs.
@@ -22,9 +22,12 @@ At the end you will have:
 | Python | 3.11 or 3.12 (3.12.6 used here) | `python --version` |
 | Node.js | 20+ with npm | `node --version` |
 | Gemini API key | From Google AI Studio, with the Live API enabled | — |
-| Ollama | Local service for embeddings | `ollama --version` |
+| Tavily API key | Backend-only key for web search tools (optional but recommended) | — |
+| Ollama | Local service for embeddings and the offline chat model | `ollama --version` |
 | Chrome or Edge | Installed for the launcher's app-mode window | — |
 | AutoHotkey v2 | Only for the global hotkey; a portable copy is recommended | — |
+
+Web tools need `TAVILY_API_KEY`. If you skip it, the assistant still works but cannot answer current-fact questions. `BRAVE_API_KEY` is an optional fallback. The offline fallback additionally needs the Ollama chat model plus Whisper and Piper assets (downloaded once in steps 5 and 5b).
 
 You do **not** need a separate Pipecat installation. The repository vendors the BSD-2-Clause Pipecat source under `pipecat/src` and `bootstrap.py` puts it on `sys.path`.
 
@@ -75,28 +78,36 @@ Other defaults that usually need no change:
 | `GEMINI_LIVE_MODEL` | `gemini-3.8-live` | Live speech-to-speech endpoint |
 | `GEMINI_VOICE` | `Puck` | Spoken voice |
 | `GEMINI_LANGUAGE` | `en-US` | Language hint |
-| `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address |
+| `HOST` / `PORT` | `127.0.0.1` / `45123` | Bind address |
 | `VOICE_DB_PATH` | `data/voice_assistant.duckdb` | Local database |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Local embeddings service |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
 | `EMBEDDING_DIM` | `768` | Must match the model and stored schema |
 | `MEMORY_MODEL` | `gemini-flash-lite-latest` | Post-call fact extraction |
 | `MEMORY_CONTEXT_LIMIT` / `CONTEXT_TURN_LIMIT` | `20` / `20` | Context injected per call |
+| `VOICE_BACKEND` | `auto` | `auto` (Gemini with offline fallback), `gemini`, or `local` |
+| `TAVILY_API_KEY` | empty | Backend-only key for `web_search` / `fetch_page` |
+| `BRAVE_API_KEY` | empty | Optional search fallback when Tavily fails |
+| `LOCAL_STT_MODEL` | `small.en` | faster-whisper model for offline STT |
+| `LOCAL_LLM_MODEL` | `qwen2.5:3b-instruct` | Ollama chat model for offline LLM |
+| `LOCAL_TTS_VOICE` | `en_US-lessac-medium` | Piper voice for offline TTS |
 
 Notes:
 
-- The API key is sent in the `x-goog-api-key` **header**, never in a URL, and is redacted from logs and error rows.
+- The Gemini key is sent in the `x-goog-api-key` **header**, never in a URL, and is redacted from logs and error rows. Tavily/Brave keys are likewise backend-only: never put them in React code, the browser, logs, or docs.
 - If Gemini returns `404` for your memory model, keep `gemini-flash-lite-latest`. The older `gemini-2.5-flash` is no longer available to new keys.
 - Other supported Live model IDs are listed in `.env.example`.
+- `auto` runs a ~1 s Gemini preflight at call start; if it fails, the call uses local models and the assistant says "I'm offline, using local models." once. Set `VOICE_BACKEND=gemini` or `local` to force a mode.
 
 ---
 
-## 5. Ollama (local embeddings)
+## 5. Ollama (embeddings + offline chat)
 
-Install Ollama from <https://ollama.com>, then pull the embedding model once:
+Install Ollama from <https://ollama.com>, then pull both models once:
 
 ```powershell
-ollama pull nomic-embed-text
+ollama pull nomic-embed-text          # 768-dim embeddings for memory/search
+ollama pull qwen2.5:3b-instruct       # offline chat model (LOCAL_LLM_MODEL)
 ```
 
 Ollama must be running when the server starts. Verify:
@@ -105,7 +116,28 @@ Ollama must be running when the server starts. Verify:
 Invoke-RestMethod http://127.0.0.1:11434/api/tags
 ```
 
-If Ollama is down, calls still work: transcripts are stored without vectors and search uses keyword matching. The assistant logs an ERROR for each failed embedding request.
+If Ollama is down, online calls still work but transcripts are stored without vectors and search uses keyword matching. Offline calls need the chat model to be present.
+
+### 5b. Local STT and TTS assets (offline fallback)
+
+`faster-whisper` downloads its model on first use into the Hugging Face cache; `small.en` (the default `LOCAL_STT_MODEL`) is ~500 MB. To pre-download it and avoid a delay on the first offline call:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from faster_whisper import WhisperModel; WhisperModel('small.en', device='cpu', compute_type='int8')"
+```
+
+Download the Piper voice once (default `LOCAL_TTS_VOICE`):
+
+```powershell
+.\.venv\Scripts\python.exe -m piper.download_voices en_US-lessac-medium --download-dir "$env:USERPROFILE\.cache\piper"
+```
+
+Pass `--download-dir` explicitly: Piper's downloader otherwise writes to the current directory, while the app reads voices from `~/.cache/piper` by default. If you store voices elsewhere, set `PIPER_MODELS_DIR` in `.env`. Both assets are only needed for offline mode; Gemini Live mode does not use them.
+
+> [!TIP]
+> Both downloads contact Hugging Face. If your network resets that connection, set `$env:HF_ENDPOINT = 'https://hf-mirror.com'` in the same PowerShell session before the Whisper command. Piper's downloader hardcodes the Hugging Face host, so if it keeps failing, download `en_US-lessac-medium.onnx` and `en_US-lessac-medium.onnx.json` from `https://hf-mirror.com/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/` into `~/.cache/piper` instead.
+>
+> If the Whisper library still cannot download, fetch `config.json`, `tokenizer.json`, `preprocessor_config.json`, `vocabulary.txt` and `model.bin` from `https://hf-mirror.com/Systran/faster-whisper-small.en/resolve/main/` into any local folder and set `LOCAL_STT_MODEL` in `.env` to that folder's path. `WhisperModel` accepts a directory as well as a model name.
 
 ---
 
@@ -131,13 +163,13 @@ Start the server:
 Verify in a browser or terminal:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health     # {"status":"ok"}
-Invoke-RestMethod http://127.0.0.1:8000/api/status # storage + embeddings info
+Invoke-RestMethod http://127.0.0.1:45123/health     # {"status":"ok"}
+Invoke-RestMethod http://127.0.0.1:45123/api/status # storage + embeddings info
 ```
 
-Open <http://127.0.0.1:8000/>, click **Start**, allow microphone access, and say hello. Localhost is a secure browser context, so WebRTC does not need HTTPS. Headphones are recommended to prevent the assistant hearing its own output. Stop the server with `Ctrl+C`.
+Open <http://127.0.0.1:45123/>, click **Start**, allow microphone access, and say hello. Localhost is a secure browser context, so WebRTC does not need HTTPS. Headphones are recommended to prevent the assistant hearing its own output. Stop the server with `Ctrl+C`.
 
-For frontend development with hot reload, run `npm run dev` in `web/` and open <http://127.0.0.1:5173/> while the Python server keeps running; Vite proxies `/ws` and `/api` to port 8000.
+For frontend development with hot reload, run `npm run dev` in `web/` and open <http://127.0.0.1:5173/> while the Python server keeps running; Vite proxies `/ws` and `/api` to port 45123.
 
 ---
 
@@ -173,11 +205,11 @@ Log out and back in, or run the shortcut once to start the hotkey immediately. T
 
 ### 7.3 Use it
 
-- **First `Ctrl + ;`**: rebuilds the React app, starts the backend, opens a small always-on-top window at the bottom-right with `?compact=1&autostart=1`, and starts the call automatically.
-- **Second `Ctrl + ;`**: closes the panel and stops the backend.
+- **First `Ctrl + ;`**: opens a small always-on-top window at the bottom-right with `?compact=1&autostart=1` and starts the call automatically. The backend is already warm, so this is near-instant.
+- **Second `Ctrl + ;`**: closes the panel and ends the call. **The backend stays running** so the next press is instant — use `-Stop` only for maintenance (the watchdog will restart it unless you stop the watchdog first).
 - **Expand ↗** in the compact panel opens the full page with the History & Memory drawer.
 
-The launcher uses a dedicated `.voice-browser-profile` with autoplay and mic flags so the call can start without a manual click. Check `.voice-hotkey.log` for every build/start/stop decision.
+The backend is kept healthy by a watchdog that starts at login; a login-time warm browser profile, memory context, embeddings, DNS/TLS, smart-turn model, and frontend build cache remove first-call delay. The launcher uses a dedicated `.voice-browser-profile` with autoplay and mic flags so the call can start without a manual click. Check `.voice-hotkey.log` for timed phase logs of every build/start/stop decision.
 
 You can also drive it directly:
 
@@ -205,9 +237,9 @@ If something fails, follow [TROUBLESHOOTING.md](TROUBLESHOOTING.md). For details
 
 ## 9. Day-to-day workflow
 
-- Start/stop with `Ctrl + ;` (or the PowerShell commands above). The launcher rebuilds the UI on every start, so frontend edits appear on the next press.
-- Keep Ollama running in the background for semantic search and memory vectors.
-- The full page at <http://127.0.0.1:8000/> is the place to browse history, memory facts and search results.
+- Toggle the panel with `Ctrl + ;` (or `-Toggle` above). The backend stays warm; the UI is rebuilt only when its sources change, so frontend edits appear on the next press.
+- Keep Ollama running in the background for semantic search, memory vectors, and offline chat.
+- The full page at <http://127.0.0.1:45123/> is the place to browse history, memory facts, reminders and search results.
 - To update the project: `git pull`, then stop and restart via `Ctrl + ;` (and re-run `pip install -r requirements.txt` if dependencies changed).
 
 ## 10. Local files you should never commit

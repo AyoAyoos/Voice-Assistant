@@ -1,17 +1,19 @@
 # Voice Assistant
 
-A standalone, local-first browser voice assistant. Microphone audio travels over WebRTC to a small FastAPI server, a vendored Pipecat pipeline streams it to **Gemini Live**, and Gemini's spoken reply is streamed back to the browser. Gemini Live handles speech recognition, conversation, and speech synthesis in one speech-to-speech session. Calls, transcripts, distilled memory, and error logs are persisted locally in DuckDB; embeddings come from local Ollama.
+A standalone, local-first browser voice assistant. Microphone audio travels over WebRTC to a small FastAPI server, and a vendored Pipecat pipeline streams it to **Gemini Live** for a natural speech-to-speech reply. If Gemini is unreachable, the same call transparently falls back to a fully local stack (faster-whisper STT + Ollama chat model + Piper TTS), and the assistant says "I'm offline, using local models." once. Calls, transcripts, distilled memory, and error logs are persisted locally in DuckDB; embeddings come from local Ollama. The assistant has real tools — live web search, page reading, memory search, time/date, reminders, and system info — shared by both backends.
 
 This folder is self-contained. No files in the upstream source repository were modified. Only the two BSD-2-Clause `LICENSE` files and the preserved per-file copyright headers carry upstream attribution.
 
 ## Features at a glance
 
-- **One hotkey, zero clicks:** `Ctrl + ;` rebuilds the UI, starts the backend, opens a compact always-on-top panel, and begins the call automatically. Press again to stop.
-- **Natural speech-to-speech:** Gemini Live owns STT, LLM and TTS, including barge-in interruption and a graceful spoken goodbye before disconnect.
+- **One hotkey, zero clicks:** the backend is kept warm 100% of the time; `Ctrl + ;` only toggles a compact always-on-top panel and starts/stops the call. The first press is instant.
+- **Natural speech-to-speech:** Gemini Live owns STT, LLM and TTS, including barge-in interruption and a graceful spoken goodbye before disconnect. Each call opens a fresh Gemini session — the microphone is not held open between calls.
+- **Offline fallback:** `VOICE_BACKEND=auto` runs a fast Gemini reachability preflight per call; if it fails, the call runs entirely on local models and announces the switch once.
+- **Real tools:** web search (`web_search`, `fetch_page`) via backend-only Tavily (optional Brave fallback), `memory_search`, `get_current_time`, reminder store/recall, `get_system_info`, and `end_conversation` — identical on both backends.
 - **Memory across calls:** durable facts are distilled after each call, embedded locally and injected into the next session's prompt, with recent turns kept for continuity.
-- **Local storage and search:** one DuckDB file holds sessions, transcripts, vectors and errors; HNSW cosine search falls back to exact/keyword search when Ollama or `vss` is unavailable.
+- **Local storage and search:** one DuckDB file holds sessions, transcripts, vectors, reminders and errors; HNSW cosine search falls back to exact/keyword search when Ollama or `vss` is unavailable.
 - **Full-page UI:** neubrutalist React interface with live status, waveform, transcript, and a History & Memory drawer.
-- **Observable:** structured ERROR logs, a DuckDB error table, launcher logs, and browser error reporting through one endpoint.
+- **Observable:** structured ERROR logs, a DuckDB error table, launcher logs with phase timings, and browser error reporting through one endpoint.
 
 ## Documentation
 
@@ -36,7 +38,10 @@ flowchart LR
     Pipeline["PipelineWorker<br/>vendored Pipecat"]
     Observer["TranscriptBridge<br/>pipeline observer<br/>state + transcript events"]
     Gemini["Gemini Live API<br/>speech-to-speech<br/>server-side VAD"]
-    DB[("DuckDB<br/>sessions / messages / memory<br/>HNSW + app_errors")]
+    Local["Local fallback<br/>faster-whisper STT<br/>Ollama chat LLM<br/>Piper TTS"]
+    Tools["Shared tools<br/>web_search / fetch_page<br/>memory / time / reminders"]
+    Tavily["Tavily API<br/>backend-only key"]
+    DB[("DuckDB<br/>sessions / messages / memory<br/>reminders / HNSW / app_errors")]
     Ollama["Local Ollama<br/>nomic-embed-text<br/>768-dim embeddings"]
 
     Browser -- "SDP offer + ICE candidates" --> WS
@@ -44,10 +49,14 @@ flowchart LR
     WS -- "owns" --> PC
     Browser -- "microphone audio track" --> PC
     PC --> Transport --> Pipeline
-    Pipeline -- "audio stream" --> Gemini
-    Gemini -- "audio stream + transcript frames" --> Pipeline
+    Pipeline -- "online: audio stream" --> Gemini
+    Pipeline -- "offline: audio stream" --> Local
+    Gemini / Local -- "reply audio + transcript frames" --> Pipeline
     Pipeline -- "reply audio track" --> PC
     PC -- "reply audio" --> Browser
+    Pipeline -- "tool calls" --> Tools
+    Tools -- "search / extract" --> Tavily
+    Tools -- "recall / store" --> DB
     Pipeline -. "frame events" .-> Observer
     Observer -- "WebSocket state / transcript" --> WS
     WS -- "state / transcript" --> Browser
@@ -56,17 +65,29 @@ flowchart LR
     Pipeline -- "local vectors" --> Ollama
 ```
 
+Per-call backend selection (`VOICE_BACKEND`): `auto` preflights Gemini and uses the local stack when it is unreachable, `gemini` forces Gemini Live, `local` always uses local models.
+
 Active pipeline frame order:
 
 ```text
+# Gemini Live (online)
 transport.input()
   -> user context aggregator
   -> GeminiLiveLLMService      (STT + LLM + TTS, server-side VAD)
   -> transport.output()
   -> assistant context aggregator
+
+# Local fallback (offline)
+transport.input()
+  -> FasterWhisperSTTService   (local STT, 16 kHz PCM)
+  -> Silero VAD + user context aggregator
+  -> OpenAILLMService -> Ollama /v1  (chat LLM + shared tools)
+  -> PiperTTSService           (local TTS)
+  -> transport.output()
+  -> assistant context aggregator
 ```
 
-`TranscriptBridge` is attached to `PipelineWorker` as an observer, not inserted into the chain. That lets it see both upstream user `TranscriptionFrame`s from Gemini Live and downstream assistant text/speaking frames without changing frame flow.
+`TranscriptBridge` is attached to `PipelineWorker` as an observer, not inserted into the chain. That lets it see both upstream user `TranscriptionFrame`s and downstream assistant text/speaking frames without changing frame flow.
 
 The browser state badge follows these events:
 
@@ -86,6 +107,34 @@ Gemini Live performs speech recognition (STT), conversation (LLM), and speech sy
 - **Interruption:** The model's server-side barge-in emits an interruption event; Pipecat flushes queued bot audio and stops the response. The UI switches from `speaking` to `listening`, and the old answer is not resumed.
 - **Ending a call:** The `end_conversation` tool is registered on `GeminiLiveLLMService`. After the model says its goodbye, the tool result uses `run_llm=False` and queues a graceful `EndFrame`. Gemini Live defers that frame until the current bot turn completes, so the goodbye audio finishes before the peer connection closes and the browser receives `call-ended`.
 - **Idle/silence:** After `IDLE_PROMPT_SECONDS` (default 15) of silence, the assistant asks once whether the user is still there. After `IDLE_END_SECONDS` (default 10) more, it says goodbye and ends the call. Real user transcript activity resets the counter and restores the first timeout.
+
+## Backend modes and offline fallback
+
+`VOICE_BACKEND` controls which stack handles a call:
+
+| Value | Behaviour |
+| --- | --- |
+| `auto` (default) | A short Gemini reachability preflight runs at call start. Reachable → Gemini Live; unreachable → local models. |
+| `gemini` | Always Gemini Live; fails if Gemini is unreachable. |
+| `local` | Always the local stack; no Gemini request is made. |
+
+In local/offline mode the assistant speaks **"I'm offline, using local models."** once at the start of every call, then behaves normally. Local STT is faster-whisper (`LOCAL_STT_MODEL`, default `small.en`), the chat model is an Ollama model (`LOCAL_LLM_MODEL`, default `qwen2.5:3b-instruct`) reached through its OpenAI-compatible `/v1` endpoint, and TTS is Piper (`LOCAL_TTS_VOICE`, default `en_US-lessac-medium`). Model downloads are described in [SETUP.md](SETUP.md). Offline mode cannot use Gemini's server-side barge-in; turn boundaries come from local Silero VAD and the smart-turn analyzer.
+
+## Tools
+
+One set of function schemas with attached handlers is built per call and registered on both Gemini Live and the local LLM, so the assistant has identical capabilities online or offline:
+
+| Tool | What it does |
+| --- | --- |
+| `web_search` | Live web search for current/changing facts (Tavily, with optional Brave fallback). |
+| `fetch_page` | Reads the text of a specific URL when a snippet is not enough. |
+| `memory_search` | Searches saved long-term facts via HNSW + keyword fallback. |
+| `get_current_time` | Current local time/date or a named IANA timezone. |
+| `store_reminder` / `list_reminders` / `complete_reminder` | Store, recall and mark reminders done — **storage only, no scheduling or notification**. |
+| `get_system_info` | Basic local OS/CPU/hostname/backend info. |
+| `end_conversation` | Says goodbye, then queues a graceful `EndFrame`. |
+
+Tavily keys are read from `.env` on the backend only. They never appear in React code, tool results, the browser, logs, or docs. Set `TAVILY_API_KEY` for web tools; `BRAVE_API_KEY` is an optional fallback used only when a Tavily call fails. If neither is configured, web tools return a graceful "unavailable" result and the assistant says it could not check right now.
 
 ## Setup and run
 
@@ -111,7 +160,7 @@ HNSW indexes, memory flow, and error-log details.
 
 For the local MVP, `.env` is populated with a working key. Treat it as a secret: rotate it when needed, and never commit it. Only `.env.example` is tracked.
 
-Open <http://127.0.0.1:8000/>, click **Start**, and allow microphone access. Localhost is a secure browser context, so WebRTC microphone access works without HTTPS. Stop the server with `Ctrl+C`.
+Open <http://127.0.0.1:45123/>, click **Start**, and allow microphone access. Localhost is a secure browser context, so WebRTC microphone access works without HTTPS. Stop the server with `Ctrl+C`.
 
 ### Frontend (React + TypeScript)
 
@@ -123,7 +172,7 @@ npm install
 npm run dev
 ```
 
-Open <http://127.0.0.1:5173/> while the Python server is running on port 8000. Vite proxies `/ws` to the FastAPI signaling endpoint, so signaling works from the dev server. `npm run build` writes the production bundle to `web/dist`; restart `app.py` after the first build so FastAPI switches from the unbundled `web/` folder to `web/dist`.
+Open <http://127.0.0.1:5173/> while the Python server is running on port 45123. Vite proxies `/ws` to the FastAPI signaling endpoint, so signaling works from the dev server. `npm run build` writes the production bundle to `web/dist`; restart `app.py` after the first build so FastAPI switches from the unbundled `web/` folder to `web/dist`.
 
 UI code lives in `web/src/features/voice-assistant/`: `useVoiceSession.ts` contains the browser WebRTC/signaling logic, and the `components/` folder holds the presentational neubrutalist components, the history drawer, and error reporting. The Python pipeline now adds persistence, context injection, and memory extraction around the unchanged WebRTC/Gemini Live audio path.
 
@@ -131,18 +180,21 @@ UI code lives in `web/src/features/voice-assistant/`: `useVoiceSession.ts` conta
 
 Press **Ctrl + ;** anywhere on the laptop to toggle the assistant:
 
-- **First press:** rebuilds the React app, starts the backend, opens a small always-on-top panel in the bottom-right corner at `http://127.0.0.1:8000/?compact=1&autostart=1`, and **starts the voice call automatically**.
-- **Second press:** closes the panel and stops the backend.
+- **Press:** opens a small always-on-top panel in the bottom-right corner at `http://127.0.0.1:45123/?compact=1&autostart=1` and **starts the voice call automatically**.
+- **Press again:** closes the panel. The backend stays warm in the background, so the next press is instant.
+- Use `-Stop` for maintenance. The watchdog restarts the backend within ~10 s; stop the watchdog first if you need it down permanently.
 
-The rebuild-on-start means UI changes are picked up on the next press. The compact panel also has an **Expand ↗** button that opens the full page. The launcher uses a dedicated browser profile and passes autoplay/microphone flags so the hotkey can start audio without a manual click.
+The frontend is built only when its sources change, and the backend is kept healthy by a watchdog that starts at login. The compact panel also has an **Expand ↗** button that opens the full page. The launcher uses a dedicated browser profile (warmed at login) and passes autoplay/microphone flags so the hotkey can start audio without a manual click.
 
-Setup is handled by `scripts/voice.ps1` (launcher) and `scripts/voice-hotkey.ahk` (AutoHotkey v2 hotkey). A portable AutoHotkey binary lives in `tools/autohotkey/` and a shortcut in the Windows Startup folder loads the hotkey at login. After editing the `.ahk` script, use the tray icon → **Reload Script**. Logs: `.voice-hotkey.log`, `.voice-backend.log`, `.voice-backend.err.log`.
+Setup is handled by `scripts/voice.ps1` (launcher/watchdog) and `scripts/voice-hotkey.ahk` (AutoHotkey v2 hotkey). A portable AutoHotkey binary lives in `tools/autohotkey/` and a shortcut in the Windows Startup folder loads the hotkey at login. After editing the `.ahk` script, use the tray icon → **Reload Script**. Logs: `.voice-hotkey.log` (timed phase logs), `.voice-backend.log`, `.voice-backend.err.log` (rotated at 2 MB).
 
 You can also drive the launcher directly:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Toggle
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Start
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Ensure
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Watch
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Build
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Stop
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scripts\voice.ps1 -Status
 ```
@@ -158,7 +210,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scrip
 | `IDLE_PROMPT_SECONDS` | `15` | Silence before the one-time idle prompt |
 | `IDLE_END_SECONDS` | `10` | Silence after the prompt before goodbye/end |
 | `HOST` | `127.0.0.1` | Bind host |
-| `PORT` | `8000` | Bind port |
+| `PORT` | `45123` | Bind port |
 | `VOICE_DB_PATH` | `data/voice_assistant.duckdb` | Local DuckDB file |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Local Ollama service |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Local embedding model |
@@ -166,6 +218,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\voice-assistant\scrip
 | `MEMORY_MODEL` | `gemini-flash-lite-latest` | Post-call fact extraction model |
 | `MEMORY_CONTEXT_LIMIT` | `20` | Memories injected into each call |
 | `CONTEXT_TURN_LIMIT` | `20` | Older turns injected into each call |
+| `CONTEXT_CACHE_TTL_SECONDS` | `300` | Reuse formatted memory context between calls |
+| `EMBEDDING_CACHE_MAX_ENTRIES` | `512` | In-memory Ollama embedding LRU size |
+| `EMBEDDING_CACHE_TTL_SECONDS` | `3600` | Ollama embedding cache lifetime |
+| `NETWORK_WAIT_SECONDS` | `10` | Brief DNS wait/retry before opening Gemini Live |
+| `VOICE_BACKEND` | `auto` | `auto`, `gemini`, or `local` backend selection |
+| `TAVILY_API_KEY` | empty | Backend-only Tavily key for `web_search` / `fetch_page` |
+| `BRAVE_API_KEY` | empty | Optional Brave fallback when a Tavily call fails |
+| `LOCAL_STT_MODEL` | `small.en` | faster-whisper model for offline STT |
+| `LOCAL_LLM_MODEL` | `qwen2.5:3b-instruct` | Ollama chat model for offline LLM |
+| `LOCAL_TTS_VOICE` | `en_US-lessac-medium` | Piper voice for offline TTS |
+| `PIPER_MODELS_DIR` | `~/.cache/piper` | Directory holding downloaded Piper voices |
 
 Supported model IDs are listed in `.env.example` and `.env`:
 
@@ -184,7 +247,7 @@ Health check: `GET /health` returns `{"status":"ok"}`.
 
 ## What was removed
 
-No auth, organizations/workspaces, workflows, campaigns, phone-call subsystems, migrations, billing, recording, external proxy/telemetry services, or product branding are present. A local DuckDB database and local Ollama embeddings are present. The outbound services are the Gemini Live API, the optional Gemini text call for memory distillation, and the public Google STUN server used for WebRTC candidate discovery.
+No auth, organizations/workspaces, workflows, campaigns, phone-call subsystems, migrations, billing, recording, external proxy/telemetry services, or product branding are present. A local DuckDB database and local Ollama embeddings are present. The outbound services are the Gemini Live API, the optional Gemini text call for memory distillation, Tavily (and optionally Brave) for web tools, and the public Google STUN server used for WebRTC candidate discovery. Offline calls make no outbound requests except these tools.
 
 ## File map
 
@@ -194,8 +257,11 @@ No auth, organizations/workspaces, workflows, campaigns, phone-call subsystems, 
 | --- | --- |
 | `app.py` | FastAPI entrypoint, static UI mount, health/status APIs, error sink, storage lifespan |
 | `bootstrap.py` | Puts `pipecat/src` on `sys.path` for the vendored package |
-| `pipeline.py` | Gemini Live session, context injection, transcripts, memory extraction, `start_pipeline()` |
-| `storage/duckdb_store.py` | DuckDB schema, sessions/messages/memory/errors, HNSW search and fallbacks |
+| `pipeline.py` | Backend selection + Gemini preflight, Live/local sessions, context injection, transcripts, memory extraction, `start_pipeline()` |
+| `tools/voice_tools.py` | Shared tool schemas and backend-only handlers (web, memory, time, reminders, system, end-call) |
+| `services/pipecat/local_stt.py` | faster-whisper STT service for the offline pipeline |
+| `services/pipecat/local_tts.py` | Piper TTS service for the offline pipeline |
+| `storage/duckdb_store.py` | DuckDB schema, sessions/messages/memory/reminders/errors, HNSW search and fallbacks |
 | `storage/embeddings.py` | Local Ollama embedding client |
 | `scripts/voice.ps1` | Hotkey launcher: rebuild, start/stop backend, autostart compact panel |
 | `scripts/voice-hotkey.ahk` | AutoHotkey v2 `Ctrl + ;` toggle |
@@ -428,5 +494,7 @@ All other copied files are verbatim. No files in the source repository were modi
 - Gemini Live uses server-side VAD, so local user start/stop frames are not normally emitted. The UI derives `listening` from user transcriptions, bot-audio stop events, and interruption frames.
 - Physical microphone spoken turns were not exercised here; interruption, end-call, and idle behavior were exercised with synthetic frames and injected text.
 - Echo-sensitive behavior should be checked with headphones first. The browser requests echo cancellation, noise suppression, and auto gain control; on speakers the model can hear its own audio and interrupt itself.
-- Final transcripts, memory facts, and errors are persisted locally, but there is no auth, workspaces, or audio recording. Browser state events are live-only.
-- The only function tool is `end_conversation`; there is no workflow or general tool-calling layer.
+- Final transcripts, memory facts, reminders, and errors are persisted locally, but there is no auth, workspaces, or audio recording. Browser state events are live-only.
+- Reminders are stored and recalled only; there is no scheduling, alarm, or notification, so the assistant never promises to alert the user later.
+- Local/offline mode is slower than Gemini Live: first load of Whisper/Piper models happens on the first offline call, responses use a small local chat model, and barge-in uses local VAD rather than Gemini's server-side interruption.
+- Web tools need a backend Tavily key (or optional Brave key) and network access. Offline audio still works without them, but current-fact questions cannot be answered reliably.
