@@ -2,22 +2,16 @@
 #SingleInstance Force
 
 ; Global hotkey for the Voice Assistant one-command launcher.
-; Ctrl + ; toggles the compact floating panel and the backend.
+; The backend is kept warm by a watchdog, so Ctrl + ; only toggles the panel.
+; voice.ps1 holds a named mutex, so rapid repeat presses are rejected there;
+; there is no client-side delay that could swallow a legitimate second press.
 
-busy := false
+; Keep the backend healthy and the browser profile warm from login onward.
+; The PowerShell script holds its own watchdog mutex, so only one copy runs.
+Run 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\voice-assistant\scripts\voice.ps1" -Watch', , "Hide"
 
 ToggleVoice(*) {
-    global busy
-    if (busy)
-        return
-    busy := true
     Run 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\voice-assistant\scripts\voice.ps1" -Toggle', , "Hide"
-    SetTimer ClearBusy, -6000
-}
-
-ClearBusy() {
-    global busy
-    busy := false
 }
 
 Hotkey "^;", ToggleVoice

@@ -1,21 +1,33 @@
 """NEW (glue): single-command entrypoint for the voice assistant."""
 
-import bootstrap  # noqa: F401  (puts the vendored Pipecat package on sys.path)
-
 import os
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
-
-import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request
+
+# Load .env before importing anything that initializes native libraries.
+load_dotenv()
+
+# CTranslate2/MKL (faster-whisper) allocates a workspace per CPU thread. On
+# machines with many cores and limited free RAM, the default thread count makes
+# Whisper's int8 model fail to load with "mkl_malloc: failed to allocate memory".
+# Set a conservative default before Pipecat/onnxruntime/CTranslate2 load so the
+# offline STT fallback stays reliable. Override with LOCAL_STT_NUM_THREADS in .env.
+_threads = os.getenv("LOCAL_STT_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", _threads)
+os.environ.setdefault("MKL_NUM_THREADS", _threads)
+
+import bootstrap  # noqa: E402,F401  (puts the vendored Pipecat package on sys.path)
+
+import asyncio  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+
+import uvicorn  # noqa: E402
+from fastapi import FastAPI, Query, Request  # noqa: E402
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel, Field
-
-load_dotenv()
 
 _ROOT = Path(__file__).parent
 _LOG_DIR = _ROOT / "logs"
@@ -35,17 +47,25 @@ logger.add(
     diagnose=True,
 )
 
+from pipeline import close_memory_client, warm_network, warm_smart_turn  # noqa: E402
 from routes.webrtc_signaling import router as signaling_router  # noqa: E402
 from storage.duckdb_store import store  # noqa: E402
 from storage.embeddings import embedder  # noqa: E402
+from tools.voice_tools import close_web_client  # noqa: E402
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Warm the pieces that would otherwise land on the first call's critical path.
+    warm_task = asyncio.create_task(warm_network())
+    await asyncio.to_thread(warm_smart_turn)
     await store.initialize()
     try:
         yield
     finally:
+        await warm_task
+        await close_memory_client()
+        await close_web_client()
         await embedder.close()
         await store.close()
 
@@ -149,11 +169,21 @@ async def api_search(
     }
 
 
+class CachedStaticFiles(StaticFiles):
+    """Serve Vite's hashed assets with long-lived immutable cache headers."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if scope.get("path", "").startswith("/assets/") and response.status_code == 200:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
 _web_root = _ROOT / "web"
 _static_dir = _web_root / "dist" if (_web_root / "dist").is_dir() else _web_root
 app.mount(
     "/",
-    StaticFiles(directory=_static_dir, html=True),
+    CachedStaticFiles(directory=_static_dir, html=True),
     name="web",
 )
 
@@ -162,5 +192,5 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host=os.getenv("HOST", "127.0.0.1"),
-        port=int(os.getenv("PORT", "8000")),
+        port=int(os.getenv("PORT", "45123")),
     )

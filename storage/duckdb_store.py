@@ -60,6 +60,7 @@ class VoiceStore:
         configured = os.getenv("VOICE_DB_PATH", "").strip()
         root = Path(__file__).resolve().parent.parent
         self.path = Path(configured) if configured else root / "data" / "voice_assistant.duckdb"
+        self._clean_flag = self.path.parent / ".voice-db-clean"
         self.embedding_dim = self._positive_int("EMBEDDING_DIM", 768)
         self.dedupe_threshold = float(os.getenv("MEMORY_DEDUPE_THRESHOLD", "0.93"))
         self._conn: Any = None
@@ -90,6 +91,8 @@ class VoiceStore:
             logger.error(f"DuckDB is unavailable; persistence disabled: {_IMPORT_ERROR}")
             return
 
+        clean_shutdown = self._clean_flag.exists()
+        self._clean_flag.unlink(missing_ok=True)
         async with self._lock:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +109,10 @@ class VoiceStore:
                 ).rowcount
                 if stale and stale > 0:
                     logger.info(f"Marked {stale} stale session row(s) as ended")
-                self._rebuild_indexes()
+                if clean_shutdown:
+                    logger.info("DuckDB index rebuild skipped (clean previous shutdown)")
+                else:
+                    self._rebuild_indexes()
                 self._available = True
                 logger.info(
                     f"DuckDB ready at {self.path} "
@@ -212,6 +218,20 @@ class VoiceStore:
         )
         self._conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id VARCHAR PRIMARY KEY,
+                content VARCHAR NOT NULL,
+                category VARCHAR,
+                status VARCHAR NOT NULL DEFAULT 'pending',
+                due_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+                metadata TEXT
+            )
+            """
+        )
+        self._conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS app_errors (
                 id VARCHAR PRIMARY KEY,
                 occurred_at TIMESTAMPTZ NOT NULL,
@@ -297,8 +317,61 @@ class VoiceStore:
                     self._conn.close()
                 except Exception as exc:
                     logger.error(f"Could not close DuckDB cleanly: {exc}")
+                else:
+                    try:
+                        self._clean_flag.write_text("ok", encoding="utf-8")
+                    except Exception as exc:
+                        logger.error(f"Could not write clean-shutdown flag: {exc}")
                 self._conn = None
             self._available = False
+
+    async def context_version(self) -> str:
+        """Cheap stamp that changes only when memories or messages are added.
+
+        ``touch_memories`` updates ``last_used_at``, which is deliberately not
+        part of this stamp so reading context does not invalidate the cache.
+        """
+        if not self._available:
+            return "unavailable"
+        async with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT
+                      (SELECT count(*) FROM memories) AS memory_count,
+                      (SELECT COALESCE(CAST(max(created_at) AS VARCHAR), '') FROM memories) AS memory_latest,
+                      (SELECT count(*) FROM messages) AS message_count,
+                      (SELECT COALESCE(CAST(max(created_at) AS VARCHAR), '') FROM messages) AS message_latest
+                    """
+                ).fetchone()
+            except Exception as exc:
+                logger.error(f"Could not read context version: {exc}")
+                return "unavailable"
+        return ":".join(str(value) for value in row)
+
+    async def memory_version(self) -> str:
+        """Stamp that changes only when distilled memories are added or changed.
+
+        Recent messages are read fresh on every call, so they must not be part
+        of this stamp: otherwise every completed call would invalidate the
+        expensive memory/embedding cache for the next call.
+        """
+        if not self._available:
+            return "unavailable"
+        async with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT
+                      count(*) AS memory_count,
+                      COALESCE(CAST(max(created_at) AS VARCHAR), '') AS memory_latest
+                    FROM memories
+                    """
+                ).fetchone()
+            except Exception as exc:
+                logger.error(f"Could not read memory version: {exc}")
+                return "unavailable"
+        return ":".join(str(value) for value in row)
 
     # ------------------------------------------------------------------ sessions
 
@@ -786,6 +859,107 @@ class VoiceStore:
                 except Exception as exc:
                     logger.opt(exception=exc).error("Could not save memory embedding")
         return memory_id
+
+    # ------------------------------------------------------------------ reminders
+
+    async def add_reminder(
+        self,
+        content: str,
+        due_at: datetime | None = None,
+        category: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Persist a reminder. This store never schedules or speaks it back."""
+        content = " ".join(content.split())
+        reminder_id = _new_id()
+        if not self._available or not content:
+            return reminder_id
+        async with self._lock:
+            try:
+                self._execute(
+                    """
+                    INSERT INTO reminders (
+                        id, content, category, status, due_at, created_at, metadata
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    [
+                        reminder_id,
+                        content,
+                        category[:40] if category else None,
+                        due_at,
+                        _utcnow(),
+                        _json(metadata),
+                    ],
+                )
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not save reminder")
+        return reminder_id
+
+    async def list_reminders(
+        self, status: str | None = "pending", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        if not self._available:
+            return []
+        where = "WHERE status = ?" if status else ""
+        params: list[Any] = [status] if status else []
+        params.append(limit)
+        async with self._lock:
+            try:
+                return self._rows(
+                    f"""
+                    SELECT id, content, category, status, due_at, created_at, completed_at
+                    FROM reminders
+                    {where}
+                    ORDER BY
+                        CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
+                        due_at ASC,
+                        created_at ASC
+                    LIMIT ?
+                    """,
+                    params,
+                )
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not list reminders")
+                return []
+
+    async def complete_reminder(
+        self,
+        reminder_id: str | None = None,
+        content_contains: str | None = None,
+    ) -> bool:
+        """Mark one pending reminder done, by id or by a content substring."""
+        if not self._available or not (reminder_id or content_contains):
+            return False
+        async with self._lock:
+            try:
+                if reminder_id:
+                    row = self._rows(
+                        "SELECT id FROM reminders WHERE id = ? AND status = 'pending' LIMIT 1",
+                        [reminder_id],
+                    )
+                else:
+                    row = self._rows(
+                        """
+                        SELECT id FROM reminders
+                        WHERE status = 'pending' AND lower(content) LIKE ?
+                        ORDER BY created_at ASC LIMIT 1
+                        """,
+                        [f"%{content_contains.lower().strip()}%"],
+                    )
+                if not row:
+                    return False
+                self._execute(
+                    """
+                    UPDATE reminders
+                    SET status = 'done', completed_at = ?
+                    WHERE id = ?
+                    """,
+                    [_utcnow(), str(row[0]["id"])],
+                )
+                return True
+            except Exception as exc:
+                logger.opt(exception=exc).error("Could not complete reminder")
+                return False
 
     # --------------------------------------------------------------------- errors
 

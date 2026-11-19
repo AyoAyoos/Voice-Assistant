@@ -7,14 +7,18 @@ web/node_modules/
 web/dist/
 tools/autohotkey/
 .voice-pids.json
+.voice-window-state.json
 .voice-hotkey.log
 .voice-backend.log
 .voice-backend.err.log
+.voice-backend.err.*.log
 server.log
 server.err.log
 .voice-browser-profile/
 # Root-only: nested pipecat/.../data folders hold vendored ONNX models.
 /data/
 /logs/
+/cache/
+.cache/
 *.duckdb
 *.duckdb.wal
