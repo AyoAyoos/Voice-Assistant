@@ -11,23 +11,24 @@ import asyncio
 import json
 import os
 import re
+import socket
+import time
 import traceback
 from typing import Any
 
 import httpx
 from loguru import logger
-from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     EndFrame,
-    FunctionCallResultProperties,
     InterruptionFrame,
     LLMMessagesAppendFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
     LLMRunFrame,
+    TTSSpeakFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
     TranscriptionFrame,
@@ -35,6 +36,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -43,16 +45,19 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
-from pipecat.services.llm_service import FunctionCallParams
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
 from services.pipecat.audio_config import AudioConfig
-from services.pipecat.pipeline_builder import build_realtime_pipeline
+from services.pipecat.local_stt import FasterWhisperSTTService
+from services.pipecat.local_tts import PiperTTSService
+from services.pipecat.pipeline_builder import build_pipeline, build_realtime_pipeline
 from services.pipecat.transport_setup import create_webrtc_transport
 from services.pipecat.worker_runner import run_pipeline_worker
 from services.pipecat.ws_sender_registry import get_ws_sender
 from storage import embeddings as embedding_service
 from storage.duckdb_store import store
+from tools.voice_tools import build_tool_schemas
 
 SYSTEM_PROMPT = """You are a friendly, helpful voice assistant on a live audio call.
 
@@ -67,6 +72,13 @@ INTERRUPTIONS
 - Never say "as I was saying" and never resume or repeat the interrupted answer unless the user asks you to.
 - Short acknowledgements from the user such as "yeah", "okay", "uh-huh" are not questions. Do not treat them as new requests; continue naturally or pause for their next message.
 - If the user's message is cut off, empty, or unclear, ask them once to repeat it briefly.
+
+TOOLS
+- You have tools for live web search, reading a web page, saved memories, the current time and date, reminders, and system information. Use them whenever the answer could depend on recent or changing facts, or on something the user told you in an earlier conversation. Never guess a current fact such as a person's current role, a price, a date, or the time.
+- Treat search results and page text as trusted facts. Answer from them briefly in your own words. Do not mention tool names, API keys, or that you "looked it up" unless the user asks.
+- If a tool fails or returns an error, say briefly that you could not check right now, then offer to answer from what you already know.
+- Reminders are only stored and recalled. Never claim that you will notify, alert, or call the user later.
+- When the call begins in offline mode you may be told to say you are using local models. Say it once, exactly as instructed, and then continue normally.
 
 ENDING THE CONVERSATION
 End the call only when one of these is clear:
@@ -95,9 +107,13 @@ Rules:
 
 
 def _redact(text: str) -> str:
-    """Remove the API key from anything that may reach an error log."""
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    return text.replace(key, "***REDACTED***") if key else text
+    """Remove backend credentials from anything that may reach an error log."""
+    safe = text
+    for name in ("GEMINI_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY"):
+        key = os.getenv(name, "").strip()
+        if key:
+            safe = safe.replace(key, "***REDACTED***")
+    return safe
 
 
 async def _record_error(
@@ -139,72 +155,237 @@ def _short(text: str, limit: int = 400) -> str:
     return clean if len(clean) <= limit else f"{clean[: limit - 1]}…"
 
 
-def _format_system_instruction(
-    memories: list[dict[str, Any]], turns: list[dict[str, Any]]
-) -> str:
+GOOGLE_API_HOST = "generativelanguage.googleapis.com"
+OFFLINE_NOTICE = "I'm offline, using local models."
+
+_memory_client: httpx.AsyncClient | None = None
+_context_cache: dict[str, tuple[float, str, list[str]]] = {}
+_context_cache_hits = 0
+_context_cache_misses = 0
+
+
+async def get_memory_client() -> httpx.AsyncClient:
+    """One pooled httpx client for post-call memory extraction."""
+    global _memory_client
+    if _memory_client is None or _memory_client.is_closed:
+        timeout = float(os.getenv("MEMORY_EXTRACTION_TIMEOUT_SECONDS", "15"))
+        _memory_client = httpx.AsyncClient(timeout=timeout)
+    return _memory_client
+
+
+async def close_memory_client() -> None:
+    global _memory_client
+    if _memory_client is not None and not _memory_client.is_closed:
+        await _memory_client.aclose()
+    _memory_client = None
+
+
+async def warm_network() -> None:
+    """Resolve Google's API host at boot so cold-boot DNS does not stall a call."""
+    started = time.perf_counter()
+    try:
+        await asyncio.to_thread(socket.getaddrinfo, GOOGLE_API_HOST, 443)
+        logger.info(
+            f"DNS warm for {GOOGLE_API_HOST}: {(time.perf_counter() - started) * 1000:.0f}ms"
+        )
+    except Exception as exc:
+        logger.warning(f"DNS warm for {GOOGLE_API_HOST} failed: {exc}")
+
+
+def warm_smart_turn() -> None:
+    """Load the ONNX turn analyzer at boot instead of on the first call."""
+    started = time.perf_counter()
+    try:
+        from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
+            LocalSmartTurnAnalyzerV3,
+        )
+
+        LocalSmartTurnAnalyzerV3()
+        logger.info(
+            f"Smart-turn model warmed: {(time.perf_counter() - started) * 1000:.0f}ms"
+        )
+    except Exception as exc:
+        logger.warning(f"Could not warm smart-turn model: {exc}")
+
+
+async def gemini_reachable() -> tuple[bool, str]:
+    """Fast preflight so an offline call can start local models immediately.
+
+    Uses a short-lived client with a small timeout; this is only a reachability
+    probe, not a conversation request, and the key stays in a request header.
+    """
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        return False, "no API key"
+    url = f"https://{GOOGLE_API_HOST}/v1beta/models"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(url, headers={"x-goog-api-key": key})
+        if response.status_code == 200:
+            return True, "ok"
+        return False, f"HTTP {response.status_code}"
+    except Exception as exc:
+        return False, _redact(str(exc))[:200]
+
+
+def select_backend() -> tuple[bool, str]:
+    """Return (use_gemini, reason) for the configured backend mode."""
+    mode = os.getenv("VOICE_BACKEND", "auto").strip().lower()
+    if mode == "gemini":
+        return True, "forced gemini"
+    if mode == "local":
+        return False, "forced local"
+    return True, "auto"
+
+
+async def wait_for_network(max_seconds: float = 10.0) -> bool:
+    """Wait briefly for DNS before opening a Gemini Live session."""
+    deadline = time.monotonic() + max_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        started = time.perf_counter()
+        try:
+            await asyncio.to_thread(socket.getaddrinfo, GOOGLE_API_HOST, 443)
+            logger.info(
+                f"Network ready for {GOOGLE_API_HOST} "
+                f"(attempt {attempt}, {(time.perf_counter() - started) * 1000:.0f}ms)"
+            )
+            return True
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"Network still unavailable for {GOOGLE_API_HOST} "
+                    f"after {attempt} attempt(s): {exc}"
+                )
+                return False
+            logger.warning(f"Network check attempt {attempt} failed: {exc}; retrying")
+            await asyncio.sleep(min(2 ** (attempt - 1), 4))
+
+
+def _format_memory_block(memories: list[dict[str, Any]]) -> str:
+    """Format only the expensive-to-build memory portion of the prompt."""
+    if not memories:
+        return ""
+    parts = [
+        "\n\nPERSISTENT CONTEXT ABOUT THE USER\n"
+        "Use these facts naturally when relevant. Never say that you retrieved, "
+        "stored, or remember them, and never list them unless asked."
+    ]
+    for memory in memories[:20]:
+        content = _short(str(memory.get("content", "")), 300)
+        if content:
+            parts.append(f"- {content}")
+    return "\n".join(parts)
+
+
+def _format_turn_block(turns: list[dict[str, Any]]) -> str:
+    """Recent turns are read fresh on every call, so they are never cached."""
+    if not turns:
+        return ""
+    parts = [
+        "\n\nRECENT EARLIER CONVERSATION (for continuity only; do not repeat it verbatim)"
+    ]
+    for turn in turns[-20:]:
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        text = _short(str(turn.get("text", "")), 350)
+        if text:
+            parts.append(f"{role}: {text}")
+    return "\n".join(parts)
+
+
+def _format_system_instruction(memory_block: str, turns: list[dict[str, Any]]) -> str:
     parts = [SYSTEM_PROMPT]
-
-    if memories:
-        parts.append(
-            "\n\nPERSISTENT CONTEXT ABOUT THE USER\n"
-            "Use these facts naturally when relevant. Never say that you retrieved, "
-            "stored, or remember them, and never list them unless asked."
-        )
-        for memory in memories[:20]:
-            content = _short(str(memory.get("content", "")), 300)
-            if content:
-                parts.append(f"- {content}")
-
-    if turns:
-        parts.append(
-            "\n\nRECENT EARLIER CONVERSATION (for continuity only; do not repeat it verbatim)"
-        )
-        for turn in turns[-20:]:
-            role = "User" if turn.get("role") == "user" else "Assistant"
-            text = _short(str(turn.get("text", "")), 350)
-            if text:
-                parts.append(f"{role}: {text}")
-
+    if memory_block:
+        parts.append(memory_block)
+    turn_block = _format_turn_block(turns)
+    if turn_block:
+        parts.append(turn_block)
     return "\n".join(parts)
 
 
 async def build_system_instruction(exclude_session_id: str) -> str:
-    """Blend the base prompt with distilled memory and recent prior turns."""
-    memories: list[dict[str, Any]] = []
+    """Blend the base prompt with distilled memory and recent prior turns.
+
+    Only the memory block (list + optional Ollama embedding + semantic search)
+    is cached. Recent turns are re-read every call so a new message is always
+    visible; this keeps back-to-back calls fast without going stale.
+    """
+    global _context_cache_hits, _context_cache_misses
+
+    started = time.perf_counter()
+    version = await store.memory_version()
+    try:
+        ttl = float(os.getenv("CONTEXT_CACHE_TTL_SECONDS", "300"))
+    except ValueError:
+        ttl = 300.0
+
+    cached = _context_cache.get(version)
+    if cached is not None and cached[0] > time.monotonic():
+        _context_cache_hits += 1
+        memory_block, memory_ids = cached[1], cached[2]
+        result = "HIT"
+    else:
+        _context_cache_misses += 1
+        memories: list[dict[str, Any]] = []
+        try:
+            memory_limit = int(os.getenv("MEMORY_CONTEXT_LIMIT", "20"))
+            memories = await store.list_memories(limit=memory_limit)
+            if len(memories) > 8:
+                query = " ".join(str(item.get("content", "")) for item in memories[-8:])
+                embedding = await embedding_service.embedder.embed_text(query)
+                if embedding:
+                    semantic = await store.search_memories(
+                        embedding=embedding, limit=memory_limit
+                    )
+                    merged: dict[str, dict[str, Any]] = {
+                        str(item["id"]): item for item in semantic
+                    }
+                    for item in memories:
+                        merged.setdefault(str(item["id"]), item)
+                    memories = list(merged.values())[:memory_limit]
+        except Exception as exc:
+            await _record_error(
+                "context-builder",
+                f"Could not load persistent memories: {exc}",
+                exc=exc,
+                session_id=exclude_session_id,
+            )
+            memories = []
+
+        memory_ids = [str(item["id"]) for item in memories]
+        memory_block = _format_memory_block(memories)
+        _context_cache[version] = (time.monotonic() + ttl, memory_block, memory_ids)
+        if len(_context_cache) > 16:
+            for stale_version in list(_context_cache)[:-16]:
+                _context_cache.pop(stale_version, None)
+        result = "MISS"
+
+    if memory_ids:
+        # Usage tracking writes last_used_at, which is not part of memory_version.
+        await store.touch_memories(memory_ids)
+
     turns: list[dict[str, Any]] = []
     try:
-        memory_limit = int(os.getenv("MEMORY_CONTEXT_LIMIT", "20"))
         turn_limit = int(os.getenv("CONTEXT_TURN_LIMIT", "20"))
-
-        memories = await store.list_memories(limit=memory_limit)
-        if len(memories) > 8:
-            query = " ".join(str(item.get("content", "")) for item in memories[-8:])
-            embedding = await embedding_service.embedder.embed_text(query)
-            if embedding:
-                semantic = await store.search_memories(embedding=embedding, limit=memory_limit)
-                merged: dict[str, dict[str, Any]] = {
-                    str(item["id"]): item for item in semantic
-                }
-                for item in memories:
-                    merged.setdefault(str(item["id"]), item)
-                memories = list(merged.values())[:memory_limit]
-
-        if memories:
-            await store.touch_memories([str(item["id"]) for item in memories])
-
         turns = await store.get_recent_messages(
             limit=turn_limit, exclude_session_id=exclude_session_id
         )
     except Exception as exc:
         await _record_error(
             "context-builder",
-            f"Could not load assistant context: {exc}",
+            f"Could not load recent turns: {exc}",
             exc=exc,
             session_id=exclude_session_id,
         )
-        memories, turns = [], []
 
-    return _format_system_instruction(memories, turns)
+    instruction = _format_system_instruction(memory_block, turns)
+    logger.info(
+        f"Context cache {result} (version={version}, hits={_context_cache_hits}, "
+        f"misses={_context_cache_misses}, "
+        f"{(time.perf_counter() - started) * 1000:.0f}ms)"
+    )
+    return instruction
 
 
 def _extract_json_array(text: str) -> list[dict[str, Any]]:
@@ -292,37 +473,36 @@ async def _extract_with_gemini(transcript: str) -> list[dict[str, Any]]:
         return []
 
     model = os.getenv("MEMORY_MODEL", "gemini-flash-lite-latest")
-    timeout = float(os.getenv("MEMORY_EXTRACTION_TIMEOUT_SECONDS", "15"))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                url,
-                headers={"x-goog-api-key": api_key},
-                json={
-                    "systemInstruction": {"parts": [{"text": MEMORY_EXTRACTION_PROMPT}]},
-                    "contents": [
-                        {"role": "user", "parts": [{"text": f"Conversation:\n{transcript}"}]}
-                    ],
-                    "generationConfig": {
-                        "temperature": 0,
-                        "responseMimeType": "application/json",
-                    },
+        client = await get_memory_client()
+        response = await client.post(
+            url,
+            headers={"x-goog-api-key": api_key},
+            json={
+                "systemInstruction": {"parts": [{"text": MEMORY_EXTRACTION_PROMPT}]},
+                "contents": [
+                    {"role": "user", "parts": [{"text": f"Conversation:\n{transcript}"}]}
+                ],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
                 },
-            )
-            response.raise_for_status()
-            payload = response.json()
-            candidates = payload.get("candidates") or []
-            if not candidates:
-                return []
-            parts = (candidates[0].get("content") or {}).get("parts") or []
-            text = "".join(
-                part.get("text", "")
-                for part in parts
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            )
-            return _extract_json_array(text)
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        candidates = payload.get("candidates") or []
+        if not candidates:
+            return []
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+        return _extract_json_array(text)
     except Exception as exc:
         await _record_error(
             "memory-extraction",
@@ -597,42 +777,50 @@ def _api_key() -> str:
     return key
 
 
-def create_end_conversation_handler(worker_getter):
-    """Return the end_conversation tool handler for one session."""
-
-    async def end_conversation(params: FunctionCallParams) -> None:
-        logger.info("end_conversation tool called")
-        await params.result_callback(
-            {"status": "success", "action": "ending_call"},
-            properties=FunctionCallResultProperties(run_llm=False),
-        )
-        worker = worker_getter()
-        if worker is None:
-            raise RuntimeError("Pipeline worker is not ready")
-        # Gemini Live defers EndFrame until the current bot turn finishes, so the
-        # goodbye audio is fully played before the transport disconnects.
-        await worker.queue_frame(EndFrame(reason="end_call_tool"))
-
-    return end_conversation
-
-
 async def start_pipeline(
     webrtc_connection: SmallWebRTCConnection,
     session_id: int,
     call_context_vars: dict | None = None,
 ) -> None:
-    """Create the Gemini Live service and run one persistent voice session."""
+    """Run one voice session on Gemini Live, or on local models when offline."""
+    started = time.perf_counter()
     logger.info(f"Starting voice session {session_id}")
 
-    model_name = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-    voice_name = os.getenv("GEMINI_VOICE", "Puck")
+    use_gemini, reason = select_backend()
+    if use_gemini and reason == "auto":
+        reachable, detail = await gemini_reachable()
+        use_gemini = reachable
+        reason = f"auto (Gemini {'reachable' if reachable else 'unreachable'}: {detail})"
+        if not reachable:
+            logger.warning(f"Gemini preflight failed: {detail}; using local models")
+    if use_gemini:
+        try:
+            network_wait = float(os.getenv("NETWORK_WAIT_SECONDS", "10"))
+        except ValueError:
+            network_wait = 10.0
+        await wait_for_network(max_seconds=network_wait)
+
+    backend_label = "gemini" if use_gemini else "local"
+    logger.info(f"Voice session {session_id} backend: {backend_label} ({reason})")
+    local_llm_model = os.getenv("LOCAL_LLM_MODEL", "qwen2.5:3b-instruct")
+    local_tts_voice = os.getenv("LOCAL_TTS_VOICE", "en_US-lessac-medium")
+
+    model_name = (
+        os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+        if use_gemini
+        else f"local:{local_llm_model}"
+    )
+    voice_name = os.getenv("GEMINI_VOICE", "Puck") if use_gemini else f"piper:{local_tts_voice}"
     language_name = os.getenv("GEMINI_LANGUAGE", "en-US")
     session_row_id = await store.create_session(
         signaling_session_id=session_id,
         model=model_name,
         voice=voice_name,
         language=language_name,
-        metadata={"context_keys": sorted((call_context_vars or {}).keys())},
+        metadata={
+            "context_keys": sorted((call_context_vars or {}).keys()),
+            "backend": backend_label,
+        },
     )
 
     session_status = "ended"
@@ -699,16 +887,9 @@ async def start_pipeline(
     idle_prompt_seconds = float(os.getenv("IDLE_PROMPT_SECONDS", "15"))
     idle_end_seconds = float(os.getenv("IDLE_END_SECONDS", "10"))
 
-    end_conversation_tool = FunctionSchema(
-        name="end_conversation",
-        description=(
-            "End the voice call after the assistant has spoken a short goodbye."
-        ),
-        properties={},
-        required=[],
-    )
-
-    end_conversation = create_end_conversation_handler(lambda: worker)
+    # One tool set, shared by Gemini Live and the local LLM fallback. Handlers
+    # are attached to the schemas, so both services auto-register them.
+    tool_schemas = build_tool_schemas(lambda: worker)
     idle_handler = IdleHandler(idle_prompt_seconds, idle_end_seconds)
 
     try:
@@ -720,28 +901,60 @@ async def start_pipeline(
         )
 
         transport = await create_webrtc_transport(
-            webrtc_connection, audio_config, is_realtime=True
+            webrtc_connection, audio_config, is_realtime=use_gemini
         )
 
         system_instruction = await build_system_instruction(session_row_id)
-        llm = GeminiLiveLLMService(
-            api_key=_api_key(),
-            tools=[end_conversation_tool],
-            settings=GeminiLiveLLMService.Settings(
-                model=model_name,
-                voice=voice_name,
-                language=language_name,
-                system_instruction=system_instruction,
-            ),
-        )
-        llm.register_function("end_conversation", end_conversation)
-
-        context = LLMContext()
-        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(
+        stt = None
+        tts = None
+        if use_gemini:
+            llm = GeminiLiveLLMService(
+                api_key=_api_key(),
+                tools=tool_schemas,
+                settings=GeminiLiveLLMService.Settings(
+                    model=model_name,
+                    voice=voice_name,
+                    language=language_name,
+                    system_instruction=system_instruction,
+                ),
+            )
+            context = LLMContext()
+            user_params = LLMUserAggregatorParams(
                 user_idle_timeout=idle_prompt_seconds
-            ),
+            )
+        else:
+            ollama_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+            llm = OpenAILLMService(
+                api_key="ollama",
+                base_url=f"{ollama_url}/v1",
+                settings=OpenAILLMService.Settings(
+                    model=local_llm_model,
+                    system_instruction=system_instruction,
+                    temperature=0.4,
+                    max_tokens=200,
+                ),
+                retry_timeout_secs=5.0,
+            )
+            # Ollama's chat endpoint accepts "system" but not "developer".
+            llm.supports_developer_role = False
+            stt = FasterWhisperSTTService(
+                model=os.getenv("LOCAL_STT_MODEL", "small.en"),
+                language="en",
+            )
+            tts = PiperTTSService(
+                voice=local_tts_voice,
+                sample_rate=audio_config.transport_out_sample_rate,
+            )
+            context = LLMContext(tools=tool_schemas)
+            user_params = LLMUserAggregatorParams(
+                user_idle_timeout=idle_prompt_seconds,
+                vad_analyzer=SileroVADAnalyzer(
+                    sample_rate=audio_config.vad_sample_rate
+                ),
+            )
+
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+            context, user_params=user_params
         )
 
         @user_aggregator.event_handler("on_user_turn_idle")
@@ -752,12 +965,22 @@ async def start_pipeline(
         async def on_user_turn_started(aggregator, *_):
             await idle_handler.reset_async()
 
-        pipeline = build_realtime_pipeline(
-            transport,
-            llm,
-            user_aggregator,
-            assistant_aggregator,
-        )
+        if use_gemini:
+            pipeline = build_realtime_pipeline(
+                transport,
+                llm,
+                user_aggregator,
+                assistant_aggregator,
+            )
+        else:
+            pipeline = build_pipeline(
+                transport,
+                stt,
+                llm,
+                tts,
+                user_aggregator,
+                assistant_aggregator,
+            )
 
         worker = PipelineWorker(
             pipeline,
@@ -790,13 +1013,22 @@ async def start_pipeline(
                     "content": "Greet the user briefly and ask how you can help.",
                 }
             )
-            await worker.queue_frames([LLMRunFrame()])
+            frames: list = []
+            if not use_gemini:
+                # Spoken once, before the greeting, on every local-mode call.
+                frames.append(TTSSpeakFrame(OFFLINE_NOTICE, append_to_context=False))
+            frames.append(LLMRunFrame())
+            await worker.queue_frames(frames)
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             logger.info("Client disconnected; ending conversation")
             await worker.cancel()
 
+        logger.info(
+            f"Voice session {session_id} setup complete in "
+            f"{(time.perf_counter() - started) * 1000:.0f}ms; starting {backend_label} pipeline"
+        )
         try:
             await run_pipeline_worker(worker, auto_end=True)
         except asyncio.CancelledError:
