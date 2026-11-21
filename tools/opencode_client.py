@@ -139,6 +139,7 @@ def _safe_error(exc: Exception) -> str:
             "GEMINI_API_KEY",
             "TAVILY_API_KEY",
             "BRAVE_API_KEY",
+            "NVIDIA_API_KEY",
         )
     ]
     # When the password comes from the local service config, it is not in the
