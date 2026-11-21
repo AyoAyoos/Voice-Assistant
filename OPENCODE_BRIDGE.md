@@ -110,6 +110,25 @@ All OpenCode models remain available. There is no provider or model deny policy.
 
 If a requested model is not found in the live catalog, the assistant says so and keeps the session's previous/default model. If you omit `model`, OpenCode uses the agent's default.
 
+For `code_task` specifically, omitting `model` uses an automatic chain instead of a single default:
+
+1. `nvidia/minimaxai/minimax-m3.1-flash` (your NVIDIA NIM key, set as `NVIDIA_API_KEY` on the OpenCode service)
+2. `nvidia/nemotron-3.5-lightning-30b-a3b` (a different NVIDIA model, so tier 2 is not a repeat of tier 1)
+3. `ollama/qwen2.5:3b-instruct` (local, no network and no credits)
+
+The chain skips models that are not in the live catalog and retries failed sessions with the next model. A permission prompt is never retried. Supplying `model` explicitly overrides the chain. The spoken result names the model that handled the task. Override the tiers with `VOICE_CODE_MODEL_PRIMARY`, `VOICE_CODE_MODEL_SECONDARY`, and `VOICE_CODE_MODEL_FALLBACK` in `.env`. Setting `VOICE_CODE_MODEL_SECONDARY` to an empty value makes that tier use OpenCode's own default model instead.
+
+All three tiers run on your NVIDIA key or your own machine, so the voice coding path never spends OpenCode/OpenRouter credits.
+
+### How this interacts with your other OpenCode tabs
+
+The global default in `~/.config/opencode/opencode.jsonc` is also set to `nvidia/minimaxai/minimax-m3.1-flash`, so **new** tabs you open start on NVIDIA instead of the OpenRouter-backed `big-pickle` model (that model was what produced the "requires more credits" error).
+
+- **Tabs that are already open keep their own model.** They are not retroactively changed.
+- **The voice assistant never touches your tabs.** It creates its own session in its own git worktree under `D:\voice-assistant-worktrees`, outside the live checkout, and selects the model on that session only.
+- **Opening the voice assistant while you work in a tab is safe.** The two run as separate OpenCode sessions with separate working directories and separate model selections.
+- To use a different model in a given tab, pick it in that tab as usual; only the *default for new tabs* changed.
+
 ## Session identity and resume
 
 - The full id looks like `ses_...`. It is kept in `opencode_session_id` and returned as `session_id`.
