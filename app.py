@@ -1,10 +1,41 @@
 """NEW (glue): single-command entrypoint for the voice assistant."""
 
 import os
+import sys
+import urllib.request
 from dotenv import load_dotenv
 
 # Load .env before importing anything that initializes native libraries.
 load_dotenv()
+
+_HOST = os.getenv("HOST", "127.0.0.1")
+_PORT = int(os.getenv("PORT", "45123"))
+
+
+def _backend_already_healthy(host: str, port: int) -> bool:
+    """True when another Voice Assistant backend already answers /health."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/health", timeout=0.75
+        ) as response:
+            return response.status == 200
+    except Exception:
+        # Connection refused, timeout, or a non-HTTP listener all mean there is
+        # no healthy backend to reuse.
+        return False
+
+
+# Run this before the heavy native imports so a duplicate launch exits fast.
+if __name__ == "__main__" and _backend_already_healthy(_HOST, _PORT):
+    print(
+        f"A Voice Assistant backend is already healthy on {_HOST}:{_PORT} "
+        "(GET /health -> 200).\n"
+        "Not starting a second instance. Press Ctrl + ; to open the panel, "
+        "run .\\scripts\\voice.ps1 -Status to inspect it, "
+        "or set PORT to a different value to run another one.",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
 
 # CTranslate2/MKL (faster-whisper) allocates a workspace per CPU thread. On
 # machines with many cores and limited free RAM, the default thread count makes
@@ -194,6 +225,6 @@ app.mount(
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host=os.getenv("HOST", "127.0.0.1"),
-        port=int(os.getenv("PORT", "45123")),
+        host=_HOST,
+        port=_PORT,
     )

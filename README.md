@@ -160,6 +160,11 @@ copy .env.example .env
 .\.venv\Scripts\python.exe app.py
 ```
 
+The hotkey watchdog may already be serving port 45123. In that case a manual
+`python app.py` prints an "already healthy" message and exits instead of failing
+with a port-bind error. Use `Ctrl + ;` to open the running assistant, or check it
+with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\voice.ps1 -Status`.
+
 If Ollama is not already running, start it and pull the embedding model once:
 
 ```powershell

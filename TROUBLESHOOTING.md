@@ -58,6 +58,23 @@ Then either press `Ctrl + ;` to let the launcher stop its tracked backend, or
 stop the other process. The launcher deliberately leaves ports it did not start
 alone to avoid killing unrelated software.
 
+The AutoHotkey script starts a watchdog (`voice.ps1 -Watch`) at login that keeps
+a backend alive on this port. If you run `python app.py` manually while that
+backend is healthy, the duplicate launch now prints an "already healthy"
+message and exits instead of producing uvicorn's `[Errno 10048]` bind error.
+The running backend is the one you want: use `Ctrl + ;` or
+`http://127.0.0.1:45123/`.
+
+To take the port over yourself:
+
+1. Exit the AutoHotkey script from its tray icon (or stop the `voice.ps1 -Watch`
+   process) so the watchdog does not restart the backend.
+2. Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\voice.ps1 -Stop`.
+3. Start your instance with `.\.venv\Scripts\python.exe app.py`.
+
+To run both at once, choose another port:
+`$env:PORT=45124; .\.venv\Scripts\python.exe app.py`.
+
 ## DuckDB is unavailable or the database is locked
 
 Only one backend process should own the database file. Stop all instances, then
