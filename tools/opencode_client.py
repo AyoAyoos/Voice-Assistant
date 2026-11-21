@@ -17,6 +17,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -338,41 +340,182 @@ class OpenCodeClient:
         logger.info(f"Created isolated OpenCode worktree at {directory}")
         return directory
 
-    async def remove_worktree(self, directory: str) -> bool:
-        """Remove a worktree and its empty parent. Manual cleanup only.
+    def _git_worktree_command(self, *args: str) -> str:
+        """Run a read-only/maintenance git worktree command in the project."""
+        result = subprocess.run(
+            ["git", "-C", str(self.project_dir), "worktree", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        return result.stdout.strip()
 
-        OpenCode creates ``<root>/<name>/<name>``; removing only the inner path
-        leaves an empty parent behind. An OpenCode session that is still holding
-        that path as its working directory can keep it locked on Windows.
+    def _worktree_status(self, directory: Path) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    async def remove_worktree(self, directory: str) -> bool:
+        """Remove a worktree, its git registration, and its empty wrapper folder.
+
+        OpenCode creates ``<root>/<name>/<name>`` but only removes the inner
+        path, which leaves the outer wrapper behind. On Windows an OpenCode
+        session whose working directory is that path keeps it locked, so the
+        OpenCode DELETE can fail with ``Permission denied`` (HTTP 400). Retry
+        briefly for the lock to clear, then fall back to git itself so cleanup
+        does not silently leave hundreds of megabytes of stale worktrees.
+
+        Only directories under the configured isolated root are ever touched.
         """
         location = await self.resolve_location(self.project_dir)
         project_id = str((location.get("project") or {}).get("id") or "")
         if not project_id:
             return False
+        target = Path(directory).resolve()
+        root = self.worktree_root.resolve()
+        if root not in target.parents:
+            logger.warning("Refusing to remove an OpenCode worktree outside the isolated root.")
+            return False
+
         removed = False
-        try:
-            await self._request(
-                "DELETE",
-                "/api/worktree",
-                json_body={"projectID": project_id, "directory": directory, "force": True},
-            )
-            removed = True
-        except OpenCodeError as exc:
-            logger.warning(f"Could not remove OpenCode worktree: {_safe_error(exc)}")
+        for attempt in range(3):
+            try:
+                await self._request(
+                    "DELETE",
+                    "/api/worktree",
+                    json_body={
+                        "projectID": project_id,
+                        "directory": str(target),
+                        "force": True,
+                    },
+                )
+                removed = True
+                break
+            except OpenCodeError as exc:
+                logger.debug(
+                    f"OpenCode worktree removal attempt {attempt + 1} failed: {_safe_error(exc)}"
+                )
+                await asyncio.sleep(0.5 * (attempt + 1))
+
         try:
             await self._request(
                 "POST", "/api/worktree/refresh", json_body={"projectID": project_id}
             )
         except OpenCodeError as exc:
             logger.debug(f"Could not refresh worktree list: {_safe_error(exc)}")
-        try:
-            parent = Path(directory).resolve().parent
-            root = self.worktree_root.resolve()
-            if root in parent.parents and parent.exists():
-                parent.rmdir()  # only succeeds when the wrapper folder is empty
-        except OSError as exc:
-            logger.debug(f"Could not remove empty worktree wrapper: {_safe_error(exc)}")
-        return removed
+
+        # OpenCode deregisters the worktree even when it cannot delete the
+        # files, so fall back to git to finish the job.
+        if target.exists():
+            try:
+                await asyncio.to_thread(self._git_worktree_command, "remove", "--force", str(target))
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.debug(f"Could not git-remove worktree: {_safe_error(exc)}")
+            try:
+                await asyncio.to_thread(self._git_worktree_command, "prune")
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.debug(f"Could not prune worktree registration: {_safe_error(exc)}")
+
+            # OpenCode may already have deregistered the worktree (and removed
+            # its .git file) while leaving the checkout behind, so git cannot
+            # finish the job. Remove any remnants directly, with a short retry
+            # for the Windows directory lock to clear.
+            for attempt in range(3):
+                if not target.exists():
+                    break
+                try:
+                    await asyncio.to_thread(shutil.rmtree, target)
+                except OSError as exc:
+                    logger.debug(
+                        f"Could not remove worktree files (attempt {attempt + 1}): "
+                        f"{_safe_error(exc)}"
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+        parent = target.parent
+        if root in parent.parents and parent.exists():
+            try:
+                # OpenCode leaves <root>/<name> behind. rmdir succeeds once the
+                # inner directory is gone; rmtree only removes the now-empty
+                # wrapper and never reaches the project checkout.
+                if any(parent.iterdir()):
+                    logger.debug(f"Worktree wrapper is not empty, preserving it: {parent}")
+                else:
+                    parent.rmdir()
+            except OSError as exc:
+                logger.debug(f"Could not remove empty worktree wrapper: {_safe_error(exc)}")
+
+        gone = not target.exists()
+        if removed and not gone:
+            logger.warning("OpenCode deregistered a worktree whose files are still on disk.")
+        return gone
+
+    def worktree_cleanup_report(self, *, max_age_days: int = 7) -> list[dict[str, str]]:
+        """Read-only report of which voice worktrees would be pruned, and why.
+
+        A worktree is only a cleanup candidate when it is older than
+        ``max_age_days`` and its git status is clean (no tracked edits and no
+        untracked files). Worktrees containing files the voice agent created are
+        always preserved so the user can inspect them.
+        """
+        report: list[dict[str, str]] = []
+        root = self.worktree_root.resolve()
+        if not root.exists():
+            return report
+        cutoff = time.time() - max(0, max_age_days) * 86400
+        for wrapper in sorted(root.iterdir()):
+            if not wrapper.is_dir():
+                continue
+            target = wrapper / wrapper.name
+            if not target.is_dir() or not (target / ".git").exists():
+                # A failed earlier removal can leave an empty wrapper behind.
+                try:
+                    has_files = any(path.is_file() for path in wrapper.rglob("*"))
+                except OSError:
+                    has_files = True
+                reason = "not a worktree" if has_files else "empty leftover"
+                action = "keep" if has_files else "prune"
+                report.append({"path": str(wrapper), "action": action, "reason": reason})
+                continue
+            entry = {"path": str(target), "action": "prune", "reason": "old and clean"}
+            try:
+                if self._worktree_status(target):
+                    entry.update(action="keep", reason="has agent files")
+                elif wrapper.stat().st_mtime > cutoff:
+                    entry.update(action="keep", reason="recent")
+            except OSError as exc:
+                entry.update(action="keep", reason=f"inspection failed: {_safe_error(exc)}")
+            report.append(entry)
+        return report
+
+    async def prune_stale_worktrees(self, *, max_age_days: int = 7) -> dict[str, int]:
+        """Remove old, clean worktrees. Preserve any worktree with agent files."""
+        stats = {"pruned": 0, "preserved_files": 0, "preserved_recent": 0, "failed": 0}
+        for entry in self.worktree_cleanup_report(max_age_days=max_age_days):
+            action = entry["action"]
+            if action == "keep":
+                key = "preserved_files" if entry["reason"] == "has agent files" else "preserved_recent"
+                stats[key] += 1
+                continue
+            if entry["reason"] == "empty leftover":
+                try:
+                    await asyncio.to_thread(shutil.rmtree, entry["path"])
+                    stats["pruned"] += 1
+                except OSError as exc:
+                    logger.debug(f"Could not remove empty worktree wrapper: {_safe_error(exc)}")
+                    stats["failed"] += 1
+                continue
+            if await self.remove_worktree(entry["path"]):
+                stats["pruned"] += 1
+            else:
+                stats["failed"] += 1
+        return stats
 
     # ----------------------------------------------------------------- session
 
