@@ -55,7 +55,7 @@ async def close_web_client() -> None:
 
 def _redact(text: str) -> str:
     safe = text
-    for name in ("TAVILY_API_KEY", "BRAVE_API_KEY", "GEMINI_API_KEY"):
+    for name in ("TAVILY_API_KEY", "BRAVE_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY"):
         key = os.getenv(name, "").strip()
         if key:
             safe = safe.replace(key, "***REDACTED***")
@@ -780,7 +780,7 @@ def _safe_bridge_error(exc: Exception) -> str:
     text = str(exc)
     values = [
         os.getenv(name, "").strip()
-        for name in ("OPENCODE_SERVICE_PASSWORD", "GEMINI_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY")
+        for name in ("OPENCODE_SERVICE_PASSWORD", "GEMINI_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY", "NVIDIA_API_KEY")
     ]
     try:
         values.append(opencode_client._service_password())
@@ -793,12 +793,15 @@ def _safe_bridge_error(exc: Exception) -> str:
 
 
 def _session_payload(record: dict[str, Any], status: str | None = None) -> dict[str, Any]:
+    provider = str(record.get("model_provider") or "")
+    model_id = str(record.get("model_id") or "")
     return {
         "status": status or record.get("status") or "unknown",
         "short_code": record.get("short_code") or _short_code(str(record.get("opencode_session_id") or "")),
         "session_id": record.get("opencode_session_id"),
         "title": record.get("title"),
         "mode": record.get("mode"),
+        "model": _spoken_model(f"{provider}/{model_id}" if provider and model_id else None),
         "summary": _clean_text(record.get("summary"), 900) or None,
         "recap": _clean_text(record.get("one_line_recap"), 300) or None,
         "file_count": len(_decode_list(record.get("files_changed"))),
@@ -832,14 +835,85 @@ async def _background_finalize(
         logger.warning(f"Background OpenCode finalizer failed: {_safe_bridge_error(exc)}")
 
 
+def _code_model_chain() -> list[str]:
+    """Ordered coding models for code_task when the caller does not pick one.
+
+    An empty entry means "use OpenCode's own default model". Every non-empty
+    entry is tried in order; a missing model or a failed session moves on to
+    the next tier. A permission prompt never triggers a fallback.
+    """
+    defaults = {
+        "VOICE_CODE_MODEL_PRIMARY": "nvidia/minimaxai/minimax-m3.1-flash",
+        # A distinct NVIDIA model. The global OpenCode default is also NVIDIA,
+        # so leaving this empty would retry the exact same model as tier 1.
+        "VOICE_CODE_MODEL_SECONDARY": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "VOICE_CODE_MODEL_FALLBACK": "ollama/qwen2.5:3b-instruct",
+    }
+    chain: list[str] = []
+    for name, default in defaults.items():
+        value = os.getenv(name, default).strip()
+        # An empty value means "use OpenCode's own default model". It is a
+        # meaningful tier, so keep exactly one even when several are empty.
+        if value:
+            if value in chain:
+                continue
+        elif "" in chain:
+            continue
+        chain.append(value)
+    return chain
+
+
+def _model_label(record: dict[str, Any], requested: str | None) -> str | None:
+    provider = str(record.get("model_provider") or "")
+    model_id = str(record.get("model_id") or "")
+    if provider and model_id:
+        return f"{provider}/{model_id}"[:160]
+    return requested or None
+
+
+def _spoken_model(label: str | None) -> str | None:
+    """Shorten a provider/model id into something easy to say aloud.
+
+    NVIDIA model ids often repeat the provider ("nvidia/nvidia/nemotron-..."),
+    which is meaningless when spoken. Fall back to the raw id when unknown.
+    """
+    if not label:
+        return None
+    provider, _, model = label.partition("/")
+    model = model.strip()
+    if provider.lower() == "nvidia" and model.lower().startswith("nvidia/"):
+        model = model[len("nvidia/"):]
+    if provider.lower() == "ollama":
+        return f"local Ollama {model}"
+    if provider.lower() == "nvidia":
+        return f"NVIDIA {model}"
+    return label[:160]
+
+
 async def code_task(params: FunctionCallParams) -> None:
     text = str(params.arguments.get("text") or "").strip()
     session_key = str(params.arguments.get("session") or "").strip() or None
     mode = str(params.arguments.get("mode") or "read").strip().lower()
     if mode not in {"read", "plan", "build"}:
         mode = "read"
-    model_ref = str(params.arguments.get("model") or "").strip() or None
+    explicit_model = str(params.arguments.get("model") or "").strip() or None
     title = str(params.arguments.get("title") or "").strip() or text[:80]
+
+    async def _approval_result(
+        session_id: str, terminal: dict[str, Any]
+    ) -> None:
+        permission = terminal.get("permission") or {}
+        await _store_pending_permission(session_id, permission)
+        await params.result_callback(
+            {
+                "status": "awaiting_approval",
+                "question": _permission_question(permission),
+                "short_code": _short_code(session_id),
+                "session_id": session_id,
+                "request_id": str(permission.get("id") or ""),
+            },
+            properties=FunctionCallResultProperties(run_llm=True),
+        )
 
     async def handler() -> None:
         if not text:
@@ -852,7 +926,7 @@ async def code_task(params: FunctionCallParams) -> None:
             healthy = await opencode_client.health()
             if not healthy:
                 raise OpenCodeError("The OpenCode service is not running.")
-            record: dict[str, Any] | None = None
+
             if session_key:
                 record = await _resolve_record(session_key)
                 if not record:
@@ -860,63 +934,126 @@ async def code_task(params: FunctionCallParams) -> None:
                 session_id = str(record["opencode_session_id"])
                 directory = str(record.get("worktree_dir") or opencode_client.project_dir)
                 agent = str(record.get("agent") or "") or await opencode_client.pick_agent(mode, directory)
-            else:
-                directory = await opencode_client.create_worktree()
-                agent = await opencode_client.pick_agent(mode, directory)
+                baseline = (await opencode_client.session_state(session_id)).get("baseline") or {}
+                terminal = await opencode_client.prompt_and_wait(
+                    session_id,
+                    text,
+                    _env_float("OPENCODE_TASK_WAIT_SECONDS", 45),
+                    metadata={"voice_source": "voice-assistant", "voice_mode": mode},
+                    baseline=baseline,
+                )
+                if terminal.get("status") == "permission":
+                    await _approval_result(session_id, terminal)
+                    return
+                if terminal.get("status") in {"timeout", "running"}:
+                    asyncio.create_task(
+                        _background_finalize(record, baseline),
+                        name=f"opencode-finalize-{_short_code(session_id)}",
+                    )
+                    await params.result_callback(
+                        {
+                            "status": "running",
+                            "short_code": _short_code(session_id),
+                            "session_id": session_id,
+                            "mode": mode,
+                            "model": _spoken_model(_model_label(record, None)),
+                            "worktree": directory,
+                            "message": "The task is still running. Ask me for a recap when you want the result.",
+                        },
+                        properties=FunctionCallResultProperties(run_llm=True),
+                    )
+                    return
+                updated = await _finalize_record(record, terminal)
+                await params.result_callback(
+                    _session_payload(
+                        updated,
+                        "completed" if updated.get("status") == "succeeded" else updated.get("status"),
+                    ),
+                    properties=FunctionCallResultProperties(run_llm=True),
+                )
+                return
+
+            directory = await opencode_client.create_worktree()
+            agent = await opencode_client.pick_agent(mode, directory)
+            models = [explicit_model] if explicit_model else _code_model_chain()
+            if not models:
+                models = [""]
+            last_error = ""
+            for index, model_ref in enumerate(models):
+                label = model_ref or "opencode-default"
+                if model_ref:
+                    try:
+                        await opencode_client.resolve_model(model_ref, directory)
+                    except OpenCodeError as exc:
+                        last_error = _safe_bridge_error(exc)
+                        logger.warning(f"Coding model {label} is unavailable: {last_error}")
+                        continue
                 info = await opencode_client.create_session(
                     directory=directory,
                     agent=agent,
                     title=title,
                     mode=mode,
-                    model_ref=model_ref,
+                    model_ref=model_ref or None,
                 )
                 session_id = str(info["id"])
                 record = await _record_from_opencode(info, mode=mode)
                 record["worktree_dir"] = directory
                 await store.upsert_opencode_session(record)
-            baseline = (await opencode_client.session_state(session_id)).get("baseline") or {}
-            terminal = await opencode_client.prompt_and_wait(
-                session_id,
-                text,
-                _env_float("OPENCODE_TASK_WAIT_SECONDS", 45),
-                metadata={"voice_source": "voice-assistant", "voice_mode": mode},
-                baseline=baseline,
-            )
-            if terminal.get("status") == "permission":
-                permission = terminal.get("permission") or {}
-                await _store_pending_permission(session_id, permission)
-                await params.result_callback(
-                    {
-                        "status": "awaiting_approval",
-                        "question": _permission_question(permission),
-                        "short_code": _short_code(session_id),
-                        "session_id": session_id,
-                        "request_id": str(permission.get("id") or ""),
+                baseline = (await opencode_client.session_state(session_id)).get("baseline") or {}
+                terminal = await opencode_client.prompt_and_wait(
+                    session_id,
+                    text,
+                    _env_float("OPENCODE_TASK_WAIT_SECONDS", 45),
+                    metadata={
+                        "voice_source": "voice-assistant",
+                        "voice_mode": mode,
+                        "voice_model_attempt": label,
                     },
+                    baseline=baseline,
+                )
+                if terminal.get("status") == "permission":
+                    await _approval_result(session_id, terminal)
+                    return
+                if terminal.get("status") in {"timeout", "running"}:
+                    asyncio.create_task(
+                        _background_finalize(record, baseline),
+                        name=f"opencode-finalize-{_short_code(session_id)}",
+                    )
+                    await params.result_callback(
+                        {
+                            "status": "running",
+                            "short_code": _short_code(session_id),
+                            "session_id": session_id,
+                            "mode": mode,
+                            "model": _spoken_model(_model_label(record, label)),
+                            "worktree": directory,
+                            "message": "The task is still running. Ask me for a recap when you want the result.",
+                        },
+                        properties=FunctionCallResultProperties(run_llm=True),
+                    )
+                    return
+                updated = await _finalize_record(record, terminal)
+                if terminal.get("status") == "failed" and index < len(models) - 1:
+                    last_error = _clean_text(
+                        updated.get("end_reason") or terminal.get("error"), 300
+                    ) or f"{label} failed"
+                    logger.warning(
+                        f"Coding model {label} failed; trying the next model. {last_error}"
+                    )
+                    continue
+                await params.result_callback(
+                    _session_payload(
+                        updated,
+                        "completed" if updated.get("status") == "succeeded" else updated.get("status"),
+                    ),
                     properties=FunctionCallResultProperties(run_llm=True),
                 )
                 return
-            if terminal.get("status") in {"timeout", "running"}:
-                asyncio.create_task(
-                    _background_finalize(record, baseline),
-                    name=f"opencode-finalize-{_short_code(session_id)}",
-                )
-                await params.result_callback(
-                    {
-                        "status": "running",
-                        "short_code": _short_code(session_id),
-                        "session_id": session_id,
-                        "mode": mode,
-                        "worktree": directory,
-                        "message": "The task is still running. Ask me for a recap when you want the result.",
-                    },
-                    properties=FunctionCallResultProperties(run_llm=True),
-                )
-                return
-            updated = await _finalize_record(record, terminal)
+            message = "No coding model was available for this task."
+            if last_error:
+                message = f"{message} Last error: {last_error}"
             await params.result_callback(
-                _session_payload(updated, "completed" if updated.get("status") == "succeeded" else updated.get("status")),
-                properties=FunctionCallResultProperties(run_llm=True),
+                {"error": message}, properties=FunctionCallResultProperties(run_llm=True)
             )
         except OpenCodeError as exc:
             message = _safe_bridge_error(exc)
@@ -1320,10 +1457,12 @@ def build_tool_schemas(worker_getter) -> list[FunctionSchema]:
             description=(
                 "Ask the already-running OpenCode coding service to do a read-only, plan, or "
                 "build task in an isolated git worktree. Use this when the user wants code "
-                "explored, planned, or changed. Always summarise the result by voice; never "
-                "read code or diffs aloud. The returned short_code is how the user refers to "
-                "the session later. If the result says awaiting_approval, ask the user yes or "
-                "no and then call code_permission_reply."
+                "explored, planned, or changed. Coding models are tried automatically in "
+                "order: the user's NVIDIA model, then a second NVIDIA model, then local Ollama; "
+                "the result says which model was used. Always summarise the result by voice; "
+                "never read code or diffs aloud. The returned short_code is how the user "
+                "refers to the session later. If the result says awaiting_approval, ask the "
+                "user yes or no and then call code_permission_reply."
             ),
             properties={
                 "text": {
@@ -1340,7 +1479,11 @@ def build_tool_schemas(worker_getter) -> list[FunctionSchema]:
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional OpenCode model such as ollama/qwen2.5:3b-instruct. Any available model is allowed.",
+                    "description": (
+                        "Optional OpenCode model such as nvidia/minimaxai/minimax-m3.1-flash "
+                        "or ollama/qwen2.5:3b-instruct. Omit it to use the automatic fallback "
+                        "chain; supplying one overrides that chain."
+                    ),
                 },
                 "title": {
                     "type": "string",
