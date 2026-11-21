@@ -171,6 +171,24 @@ Each new task creates a git worktree at:
 
 OpenCode returns the nested path; the assistant stores that path and reuses it on resume. Worktrees are **not** auto-deleted, because you may want to review, diff, or merge the changes. The live checkout is never edited by voice coding tasks.
 
+### Why a worktree contains the whole project
+
+A git worktree is a complete, independent checkout of the repository at the current commit. That is why a folder such as `voice-20261121-074022-9207` contains `README.md`, `app.py`, `pipecat/`, `web/`, and every other tracked file: those are the baseline files Git checks out for you, not files the voice agent created. They let the agent read the codebase and let you diff its changes in place.
+
+Only the files reported by `git status` were created or changed by the agent. For example, a worktree with two untracked files shows:
+
+```text
+?? PROD_BACKUP_WALKTHROUGH.md
+?? index.html
+```
+
+The voice tool's `file_count` and `files_changed` fields count exactly those entries, never the baseline checkout. To see only the agent's work:
+
+```powershell
+cd D:\voice-assistant-worktrees\<name>\<name>
+git status --porcelain
+```
+
 To review and merge manually:
 
 ```powershell
@@ -187,6 +205,25 @@ To clean up a worktree after review:
 ```
 
 If Windows reports that the directory is in use, an OpenCode session is still holding it as its working directory. Delete the OpenCode session, restart the background service (`opencode service restart`), then rerun the cleanup command. Do not force-delete a directory with changes you still need.
+
+`remove_worktree` now retries while a Windows directory lock clears, falls back to `git worktree remove --force` and `git worktree prune` when OpenCode deregisters a worktree but leaves its files behind, and removes the empty outer wrapper folder. It refuses to touch paths outside `OPENCODE_WORKTREE_ROOT`.
+
+### Pruning old worktrees
+
+Voice sessions accumulate over time, and each worktree is a full checkout, so old sessions can use hundreds of megabytes. This script is dry-run by default and never deletes a worktree that has untracked files or tracked edits:
+
+```powershell
+# Report what would be removed, and why
+.\.venv\Scripts\python.exe scripts\prune_voice_worktrees.py
+
+# Actually remove old clean worktrees and empty broken wrappers
+.\.venv\Scripts\python.exe scripts\prune_voice_worktrees.py --apply
+
+# More aggressive: prune clean worktrees older than one day
+.\.venv\Scripts\python.exe scripts\prune_voice_worktrees.py --max-age-days 1 --apply
+```
+
+A worktree is pruned only when it is older than `--max-age-days` (default 7) **and** its git status is clean. Empty wrappers left behind by a failed earlier cleanup are always safe to remove. Worktrees containing files the agent created are always kept so you can inspect or merge them.
 
 ## Configuration reference
 
